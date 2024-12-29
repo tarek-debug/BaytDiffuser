@@ -2,7 +2,7 @@
 generate_output.py
 
 Uses the trained Transformer + Diffusion model to generate Classical Arabic poems
-from modern Arabic inputs.
+from an input text (modern Arabic or any input prompt).
 
 Usage:
     python generate_output.py --input_file ../data/examples/modern_poems.txt --output_dir ../results/outputs
@@ -24,7 +24,7 @@ def generate_output(input_file, output_dir):
     transformer_model, transformer_tokenizer = load_transformer_model()
     diffusion_model = load_diffusion_model()
 
-    # Read the modern poems
+    # Read the modern poems (or any input lines)
     with open(input_file, 'r', encoding='utf-8') as f:
         modern_poems = f.readlines()
 

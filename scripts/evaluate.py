@@ -24,7 +24,7 @@ def evaluate_model_outputs(input_dir, metrics_output):
     # Ensure metrics output directory exists
     os.makedirs(metrics_output, exist_ok=True)
 
-    # Example: Iterate through generated files
+    # Iterate through generated files
     results = []
     for filename in os.listdir(input_dir):
         if filename.endswith(".txt"):
@@ -43,7 +43,7 @@ def evaluate_model_outputs(input_dir, metrics_output):
             })
 
     # Optional: Compare with baseline models
-    # E.g., compare_with_baselines(results)
+    compare_with_baselines(results)
 
     # Save results as JSON
     output_path = os.path.join(metrics_output, "evaluation_results.json")
