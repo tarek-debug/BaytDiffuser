@@ -1,0 +1,13 @@
+# requirements.txt
+
+numpy
+pandas
+tensorflow  # Specify the version compatible with your CUDA installation
+keras
+scikit-learn
+h5py
+pyarabic
+transformers
+torch  # Required by some transformer models
+matplotlib
+seaborn

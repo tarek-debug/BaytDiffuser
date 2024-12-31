@@ -14,7 +14,7 @@ Usage:
 import os
 import argparse
 import pandas as pd
-from utils import create_transformer_model, train_transformer_model, load_encoder, get_input_encoded_data_h5
+from BaytDiffuser.scripts.python.utils import create_transformer_model, train_transformer_model, load_encoder, get_input_encoded_data_h5
 
 def load_dataset_from_csv(processed_dir):
     """

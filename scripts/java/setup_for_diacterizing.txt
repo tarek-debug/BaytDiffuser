@@ -1,0 +1,111 @@
+To create a Java program that diacritizes your dataset using Farasa, you'll need to integrate the Farasa Diacritizer into your Java code and work with your dataset as an input file. Below is a step-by-step guide along with a Java program example:
+
+---
+
+### Steps to Create and Run the Java Program
+
+1. **Download and Set Up Farasa Diacritizer**
+   - Obtain the Farasa Diacritizer JAR file by registering at [Farasa's website](https://farasa.qcri.org/).
+   - If you also need other components like `FarasaSegmenter`, download and set them up as described in the documentation.
+
+2. **Prepare Your Environment**
+   - Install Java 7 or Java 8 (earlier versions may not work).
+   - Install [Apache Ant](https://ant.apache.org/) if you need to compile the source code.
+
+3. **Prepare Your Dataset**
+   - Save your dataset (`apcd_full.csv`) as a plain text file (e.g., `apcd_full.txt`).
+   - Ensure the file is UTF-8 encoded.
+
+4. **Create the Java Program**
+   - The following program reads the input dataset file, uses the Farasa Diacritizer, and writes the diacritized text to a new file.
+
+---
+
+### Example Java Program
+
+```java
+import java.io.*;
+import java.util.ArrayList;
+import com.qcri.farasa.diacritize.DiacritizeText;
+import com.qcri.farasa.segmenter.Farasa;
+
+public class DatasetDiacritizer {
+    public static void main(String[] args) throws Exception {
+        // Set paths
+        String inputFilePath = "../data/raw/apcd/apcd_full.txt";
+        String outputFilePath = "../data/raw/apcd/apcd_full_diacritized.txt";
+        String dataDirectory = "/path/to/farasa/data"; // Update this path to your Farasa data directory
+
+        // Initialize Farasa components
+        Farasa farasa = new Farasa();
+        DiacritizeText diacritizer = new DiacritizeText(dataDirectory, "all-text.txt.nocase.blm", farasa);
+
+        // Read the input file
+        BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(inputFilePath), "UTF-8"));
+        BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(outputFilePath), "UTF-8"));
+
+        String line;
+        while ((line = reader.readLine()) != null) {
+            if (!line.trim().isEmpty()) {
+                // Diacritize the line
+                String diacritizedLine = diacritizer.diacritize(line.trim());
+                writer.write(diacritizedLine);
+                writer.newLine();
+            }
+        }
+
+        // Close resources
+        reader.close();
+        writer.close();
+
+        // Cleanup Farasa resources
+        farasa.close();
+
+        System.out.println("Diacritization complete! Output saved to: " + outputFilePath);
+    }
+}
+```
+
+---
+
+### Instructions to Run the Program
+
+1. **Compile the Program**
+   - Save the above Java program as `DatasetDiacritizer.java`.
+   - Compile the program with the Farasa JAR file in the classpath:
+     ```bash
+     javac -cp ".:path/to/FarasaDiacritize.jar:path/to/FarasaSegmenter.jar" DatasetDiacritizer.java
+     ```
+
+2. **Run the Program**
+   - Run the compiled program, specifying the classpath:
+     ```bash
+     java -cp ".:path/to/FarasaDiacritize.jar:path/to/FarasaSegmenter.jar" DatasetDiacritizer
+     ```
+
+In my example:
+javac -cp ".:./QCRI/Dev/ArabicNLP/Farasa/FarasaDiacritizeJar/dist/FarasaDiacritizeJar.jar:.:./QCRI/Dev/ArabicNLP/Farasa/FarasaDiacritizeJar/dist/lib/*" DatasetDiacritizer.java
+
+java -cp ".:./QCRI/Dev/ArabicNLP/Farasa/FarasaDiacritizeJar/dist/FarasaDiacritizeJar.jar:.:./QCRI/Dev/ArabicNLP/Farasa/FarasaDiacritizeJar/dist/lib/*" DatasetDiacritizer
+
+3. **Verify Output**
+   - The diacritized dataset will be saved in `../data/raw/apcd/apcd_full_diacritized.txt`.
+
+---
+
+### Notes
+
+- **Dependencies**:
+  - Ensure all required JAR files (`FarasaSegmenter.jar`, `FarasaDiacritize.jar`, etc.) are available in the specified paths.
+  - Include other JARs like `weka.jar` and `trove.jar` if required.
+
+- **Input and Output**:
+  - Input: The program reads the input dataset line by line from a text file.
+  - Output: The diacritized text is saved to a new file.
+
+- **Path Adjustments**:
+  - Update `dataDirectory` and file paths according to your system setup.
+
+---
+
+This program uses the Farasa library to process text data efficiently and saves the diacritized version of your dataset. Let me know if you encounter any issues! 😊

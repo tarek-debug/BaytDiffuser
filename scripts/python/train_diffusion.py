@@ -13,7 +13,7 @@ Usage:
 import os
 import argparse
 import pandas as pd
-from utils import create_diffusion_model, train_diffusion_model, load_encoder, get_input_encoded_data_h5
+from BaytDiffuser.scripts.python.utils import create_diffusion_model, train_diffusion_model, load_encoder, get_input_encoded_data_h5
 
 def load_dataset_from_csv(processed_dir):
     """

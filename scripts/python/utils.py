@@ -17,9 +17,9 @@ from itertools import product
 # TensorFlow and Keras
 import tensorflow as tf
 from tensorflow.keras.models import Model, Sequential, load_model
-from tensorflow.keras.layers import Dense, Bidirectional, LSTM, CuDNNLSTM, Input, LayerNormalization, Dropout
+from tensorflow.keras.layers import Dense, Bidirectional, LSTM, Input, LayerNormalization, Dropout
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, TensorBoard
-from tensorflow.keras.utils import Sequence, multi_gpu_model
+from tensorflow.keras.utils import Sequence
 from tensorflow.keras import backend as K
 
 # Scikit-learn
@@ -99,6 +99,124 @@ class Arabic:
     tashkeel = [fathatan, dammatan, kasratan, fatha, damma, kasra, sukun, shadda]
 
 AR = Arabic()  # Convenience instance
+# =============================================================================
+# Data Cleaning and Preprocessing
+# =============================================================================
+
+def Clean_data(processed_df, max_bayt_len, verse_column_name='text'):
+    """
+    Cleans and preprocesses the DataFrame containing Arabic poetry.
+    
+    Steps:
+    - Normalize Hamza variations.
+    - Remove non-Arabic characters.
+    - Factor shadda and tanwin.
+    - Limit text length to 'max_bayt_len'.
+    
+    Args:
+        processed_df (pd.DataFrame): DataFrame with Arabic poetry.
+        max_bayt_len (int): Maximum allowed length for each poem.
+        verse_column_name (str): Column name containing the poetry text.
+    
+    Returns:
+        pd.DataFrame: Cleaned and filtered DataFrame.
+    """
+    # Remove diacritics and normalize Hamza
+    processed_df['text'] = processed_df[verse_column_name].apply(lambda x: araby.normalize_hamza(x))
+    
+    # Remove non-Arabic characters (retain spaces and line breaks)
+    processed_df['text'] = processed_df['text'].apply(lambda x: re.sub(r'[^\u0600-\u06FF\s]', '', x))
+    
+    # Apply shadda and tanwin factoring
+    processed_df['text'] = processed_df['text'].apply(factor_shadda_tanwin)
+    
+    # Limit text length
+    processed_df = processed_df[processed_df['text'].apply(len) <= max_bayt_len]
+    
+    return processed_df
+
+# =============================================================================
+# Additional Feature Extraction
+# =============================================================================
+
+def extract_rhyme_info(df):
+    """
+    Extracts basic rhyme info from the 'rhyme' column or from the last word of a verse.
+    Example: 
+       - We can store the last two characters of 'rhyme' as a simplistic rhyme scheme.
+       - Or combine with 'combined_verse' to see if the last words match across verses.
+    
+    Args:
+        df (pd.DataFrame): DataFrame containing at least a 'rhyme' column or a 'combined_verse' column.
+    
+    Returns:
+        pd.DataFrame: Updated DataFrame with a new 'rhyme_info' column.
+    """
+    if 'rhyme' in df.columns:
+        # Basic approach: take the last 2-3 characters of 'rhyme'
+        def get_rhyme_suffix(r):
+            return r[-2:] if isinstance(r, str) and len(r) >= 2 else r
+        
+        df['rhyme_info'] = df['rhyme'].apply(get_rhyme_suffix)
+    else:
+        # If there's no 'rhyme' col, fallback to last word from 'combined_verse'
+        if 'combined_verse' in df.columns:
+            def get_last_word_rhyme(text):
+                lines = text.split('#')
+                # Last line
+                last_line = lines[-1].strip()
+                last_word = last_line.split()[-1] if last_line.split() else ''
+                return last_word[-2:] if len(last_word) >= 2 else last_word
+
+            df['rhyme_info'] = df['combined_verse'].apply(get_last_word_rhyme)
+        else:
+            df['rhyme_info'] = None
+    
+    return df
+
+def get_verse_length_features(df):
+    """
+    Adds columns for verse length, average shatr length, or other length-based features.
+    
+    Args:
+        df (pd.DataFrame): DataFrame containing Arabic poetry. 
+                          Expects columns like 'الشطر الايمن' and 'الشطر الايسر' or 'combined_verse'.
+    
+    Returns:
+        pd.DataFrame: Updated DataFrame with new length-based columns.
+    """
+    if 'combined_verse' in df.columns:
+        # Count total length of combined_verse
+        df['verse_length'] = df['combined_verse'].apply(lambda v: len(v.replace('#', ' ')))
+        # Approx average shatr length
+        def avg_shatr_len(v):
+            parts = v.split('#')
+            if len(parts) == 2:
+                left_len = len(parts[0].strip())
+                right_len = len(parts[1].strip())
+                return (left_len + right_len) / 2
+            return len(v)
+        df['avg_shatr_length'] = df['combined_verse'].apply(avg_shatr_len)
+    else:
+        # If we have 'الشطر الايمن' and 'الشطر الايسر'
+        if 'الشطر الايسر' in df.columns and 'الشطر الايمن' in df.columns:
+            def combined_len(row):
+                left_len = len(str(row['الشطر الايسر']))
+                right_len = len(str(row['الشطر الايمن']))
+                return left_len + right_len
+
+            df['verse_length'] = df.apply(combined_len, axis=1)
+            df['avg_shatr_length'] = df['verse_length'] / 2
+        else:
+            # Fallback
+            df['verse_length'] = df['text'].apply(len)
+            df['avg_shatr_length'] = df['text'].apply(len)
+    
+    return df
+
+# =============================================================================
+# Tashkeel-Related Functions
+# =============================================================================
 
 def separate_token_with_diacritics(token):
     """
@@ -261,17 +379,30 @@ def oneHot_per_batch(batch_strings, padding_length):
 
     return encodedBatch
 
-def check_percentage_tashkeel(string, threshold=0.7):
+def check_percentage_tashkeel(string, threshold=0.4):
     """
-    Checks if the percentage of characters with diacritics exceeds the threshold.
+    Checks if the percentage of alphabetic characters with diacritics meets the threshold.
+    Excludes letters where tashkeel is implied from the calculation.
+    
     Returns True if percentage >= threshold, else False.
     """
-    total_chars = len(string)
+    # Letters where tashkeel is often implied and doesn't need explicit diacritics
+    implied_tashkeel_letters = {AR.alef, AR.waw, AR.yeh}
+    
+    # Filter out implied tashkeel letters from total_chars
+    total_chars = sum(1 for c in string if c.isalpha() and c not in implied_tashkeel_letters)
     if total_chars == 0:
         return False
-    chars_with_diacritics = sum(1 for c in string if c in AR.tashkeel)
+
+    # Count characters with explicit diacritics (excluding implied tashkeel letters)
+    chars_with_diacritics = sum(
+        1 for c in string if c not in implied_tashkeel_letters and c in AR.tashkeel
+    )
+    
+    # Calculate percentage
     percentage = chars_with_diacritics / total_chars
     return percentage >= threshold
+
 
 def save_h5(file_path, dataset_name, dataVar):
     """
