@@ -16,7 +16,7 @@ Usage:
 import os
 import argparse
 import json
-from utils import (
+from BaytDiffuser.scripts.python.utils import (
     calculate_meter_score,
     calculate_rhyme_score,
     compare_with_baselines,

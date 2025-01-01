@@ -12,7 +12,7 @@ Usage:
 
 import os
 import argparse
-from utils import (
+from BaytDiffuser.scripts.python.utils import (
     load_transformer_model,
     load_diffusion_model,
     generate_classical_poem
