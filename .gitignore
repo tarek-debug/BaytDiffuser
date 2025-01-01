@@ -1,3 +1,9 @@
+# Ignore .h5 files and related model artifacts
+*.h5
+.keras
+.v2
+.pb
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

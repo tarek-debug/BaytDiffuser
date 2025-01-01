@@ -47,6 +47,13 @@ from transformers import (
 # Arabic-specific modules
 import pyarabic.araby as araby
 
+
+# Define consistent parameters
+max_length = 128
+max_bayt_len = 128
+encoding_dim = 8
+
+
 ###############################################################################
 #                           Arabic References and Processing
 ###############################################################################
@@ -122,18 +129,18 @@ AR = Arabic()  # Convenience instance
 def Clean_data(processed_df, max_bayt_len, verse_column_name='text'):
     """
     Cleans and preprocesses the DataFrame containing Arabic poetry.
-    
+
     Steps:
     - Normalize Hamza variations.
     - Remove non-Arabic characters.
     - Factor shadda and tanwin.
     - Limit text length to 'max_bayt_len'.
-    
+
     Args:
         processed_df (pd.DataFrame): DataFrame with Arabic poetry.
         max_bayt_len (int): Maximum allowed length for each poem.
         verse_column_name (str): Column name containing the poetry text.
-    
+
     Returns:
         pd.DataFrame: Cleaned and filtered DataFrame.
     """
@@ -163,7 +170,7 @@ def normalize_arabic(text):
     text = re.sub(r'ة', 'ه', text)
     text = re.sub(r'ـ', '', text)
 
-    # remove diacritics except shadda/sukun
+    # Remove diacritics except shadda (\u0651) and sukun (\u0652)
     normalized_text = ''.join(
         char if unicodedata.category(char) != 'Mn' or char in ['ّ', 'ْ'] else ''
         for char in text
@@ -336,6 +343,8 @@ def factor_shadda_tanwin(string):
             elif dia == AR.shadda:
                 factoredString += base + AR.sukun + base
         else:
+            # Length=3 means something like "شَّ"
+            # "ش" + "شْ" + next diacritic
             base = char[0]
             # char[1] presumably is AR.shadda
             # char[2] is e.g., AR.fatha
@@ -355,6 +364,16 @@ from itertools import product
 encoding_combination = [list(i) for i in product([0, 1], repeat=8)]
 
 def string_with_tashkeel_vectorizer(string, padding_length):
+    """
+    Vectorizes a string with tashkeel into a binary matrix.
+    
+    Args:
+        string (str): The input string.
+        padding_length (int): The maximum length to pad/truncate the string.
+    
+    Returns:
+        np.ndarray: Array of shape (padding_length, 8).
+    """
     factored_str = factor_shadda_tanwin(string)
     tokens = separate_token_with_diacritics(factored_str)
     representation = []
@@ -363,17 +382,11 @@ def string_with_tashkeel_vectorizer(string, padding_length):
             idx = lettersTashkeelCombination.index(tok)
             representation.append(encoding_combination[idx])
         else:
-            representation.append([0]*8)
+            representation.append([0]*8)  # Unknown tokens are represented as all zeros
     extra = padding_length - len(representation)
     for _ in range(extra):
-        representation.append([0]*8)
+        representation.append([0]*8)  # Padding
     return np.array(representation, dtype=np.int32)
-
-def string_with_tashkeel_vectorizer_per_batch(batch_series, max_bayt_len):
-    out = []
-    for val in batch_series:
-        out.append(string_with_tashkeel_vectorizer(val, max_bayt_len))
-    return np.stack(out, axis=0)
 
 def oneHot_per_sample(string, padding_length):
     cleanedString = factor_shadda_tanwin(string)
@@ -439,11 +452,20 @@ def decode_classes(onehot_vec, encoder):
 #                      Transformer Auto-Encoding for Classical Style
 ###############################################################################
 
-def create_transformer_for_classical_style(model_name='aubmindlab/bert-base-arabertv2', max_length=128):
+def create_transformer_for_classical_style(model_name='t5-small', max_length=128):
     """
-    Creates a simple Transformer-based model for 'auto-encoding' or masked language modeling
-    on classical poems. Example uses T5-based seq2seq or BERT-based approach.
+    Creates a Transformer-based Seq2Seq model for 'auto-encoding' on classical poems.
+    Uses T5 architecture.
+    
+    Args:
+        model_name (str): Pretrained model name compatible with Seq2Seq.
+        max_length (int): Maximum sequence length.
+    
+    Returns:
+        tf.keras.Model: Compiled Transformer model.
     """
+    from transformers import TFAutoModelForSeq2SeqLM
+    
     model = TFAutoModelForSeq2SeqLM.from_pretrained(model_name)
     model.compile(
         optimizer=Adam(learning_rate=1e-4),
@@ -459,7 +481,6 @@ def train_transformer_for_classical_style(df_classical, tokenizer, model,
     Trains the Transformer model in a self-supervised manner on classical poems.
     Input=verse, Output=the same verse (auto-encoder style).
     """
-    os.makedirs(output_dir, exist_ok=True)
     texts = df_classical['text'].tolist()
 
     # Prepare data
@@ -474,35 +495,34 @@ def train_transformer_for_classical_style(df_classical, tokenizer, model,
         input_ids, attention_mask, labels, test_size=0.2, random_state=42
     )
 
-    train_dataset = tf.data.Dataset.from_tensor_slices((
-        {'input_ids': train_ids, 'attention_mask': train_mask},
-        y_train
-    )).batch(batch_size)
+    # Modify dataset to include labels within the input dictionary
+    train_dataset = tf.data.Dataset.from_tensor_slices(({
+        'input_ids': train_ids,
+        'attention_mask': train_mask,
+        'labels': y_train
+    })).batch(batch_size)
 
-    val_dataset = tf.data.Dataset.from_tensor_slices((
-        {'input_ids': val_ids, 'attention_mask': val_mask},
-        y_val
-    )).batch(batch_size)
+    val_dataset = tf.data.Dataset.from_tensor_slices(({
+        'input_ids': val_ids,
+        'attention_mask': val_mask,
+        'labels': y_val
+    })).batch(batch_size)
 
-    ckpt_path = os.path.join(output_dir, "transformer_ckpt.h5")
-    ckpt = ModelCheckpoint(ckpt_path, save_best_only=True,
-                           monitor='val_accuracy', mode='max', verbose=1)
+    # Callbacks (without saving model)
     es = EarlyStopping(monitor='val_accuracy', patience=3,
                        restore_best_weights=True, mode='max')
     tb = TensorBoard(log_dir=os.path.join(output_dir, 'logs'))
 
+    # Train the model
     history = model.fit(
         train_dataset,
         validation_data=val_dataset,
         epochs=epochs,
-        callbacks=[ckpt, es, tb]
+        callbacks=[es, tb]  # Removed ModelCheckpoint
     )
 
-    final_model_path = os.path.join(output_dir, "transformer_classical_final.h5")
-    model.save_weights(final_model_path)
-    print(f"[INFO] Transformer final weights saved to {final_model_path}")
-
     return model, history
+
 
 def inference_convert_modern_to_classical(modern_verse, tokenizer, model, max_length=128):
     """
@@ -533,9 +553,14 @@ def inference_convert_modern_to_classical(modern_verse, tokenizer, model, max_le
 ###############################################################################
 
 def create_diffusion_model(input_shape, model_params):
-    from tensorflow.keras.layers import MultiHeadAttention, Add
+    """
+    Creates a Transformer-based diffusion model for text representation refinement using BatchNormalization.
+    """
+    from tensorflow.keras.layers import MultiHeadAttention, Add, BatchNormalization, Dense, Input
+    from tensorflow.keras.models import Model, Sequential
+
     inputs = Input(shape=input_shape, name='diffusion_input')
-    x = LayerNormalization()(inputs)
+    x = BatchNormalization()(inputs)
 
     for i in range(model_params.get('num_transformer_blocks', 2)):
         attention = MultiHeadAttention(
@@ -543,43 +568,88 @@ def create_diffusion_model(input_shape, model_params):
             key_dim=model_params.get('key_dim', 64)
         )(x, x)
         x = Add()([x, attention])
-        x = LayerNormalization()(x)
+        x = BatchNormalization()(x)
+
+        # FFN
         ffn = Sequential([
             Dense(model_params.get('ffn_units', 256), activation='relu'),
             Dense(input_shape[-1])
         ])
         ffn_out = ffn(x)
         x = Add()([x, ffn_out])
-        x = LayerNormalization()(x)
+        x = BatchNormalization()(x)
 
     outputs = Dense(input_shape[-1], activation='linear')(x)
     model = Model(inputs=inputs, outputs=outputs, name='DiffusionModel')
+
     model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    model.summary()
     return model
 
 def train_diffusion_for_classical_style(df_classical, diffusion_model, tokenizer,
-                                        max_length=128, epochs=5, batch_size=4,
-                                        output_dir='./diffusion_output'):
+                                        max_length=128, max_bayt_len=128, encoding_dim=8,
+                                        epochs=5, batch_size=4, output_dir='./diffusion_output'):
     """
     Trains the diffusion model in a self-supervised manner on classical poems.
-    We do a dummy approach: feed token IDs as if they are 'embeddings' and
-    train the model to reconstruct them.
+    Encodes token IDs as embeddings and trains the model to reconstruct them.
     """
+    import os
+    import numpy as np
+    from sklearn.model_selection import train_test_split
+    from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, TensorBoard
+
     os.makedirs(output_dir, exist_ok=True)
 
+    # Prepare text data
     texts = df_classical['text'].tolist()
     enc = tokenizer(texts, max_length=max_length, padding='max_length', truncation=True, return_tensors='np')
     X = enc['input_ids']
     Y = X.copy()
 
+    # Reshape and encode to match the expected input of the diffusion model
+    def embed_tokens(input_ids, max_bayt_len, encoding_dim):
+        """
+        Embeds token IDs into a higher-dimensional space to match the diffusion model's input.
+        """
+        batch_size, seq_len = input_ids.shape
+        # Pad or truncate to `max_bayt_len`
+        if seq_len < max_bayt_len:
+            padded = np.pad(input_ids, ((0, 0), (0, max_bayt_len - seq_len)), constant_values=0)
+        else:
+            padded = input_ids[:, :max_bayt_len]
+        # Add a synthetic embedding dimension
+        return np.expand_dims(padded, -1).repeat(encoding_dim, axis=-1)
+
+    X = embed_tokens(X, max_bayt_len, encoding_dim)
+    Y = X.copy()
+
+    # Split into training and validation sets
     X_train, X_val, Y_train, Y_val = train_test_split(X, Y, test_size=0.2, random_state=42)
 
-    ckpt_path = os.path.join(output_dir, "diff_ckpt.h5")
-    ckpt = ModelCheckpoint(ckpt_path, save_best_only=True,
-                           monitor='val_mae', mode='min', verbose=1)
-    es = EarlyStopping(monitor='val_mae', patience=3, restore_best_weights=True, mode='min')
+    print(f"X_train shape: {X_train.shape}")  # Should be (num_samples, 128, 8)
+    print(f"Y_train shape: {Y_train.shape}")  # Should be (num_samples, 128, 8)
+    print(f"X_val shape: {X_val.shape}")      # Should be (num_samples, 128, 8)
+    print(f"Y_val shape: {Y_val.shape}")      # Should be (num_samples, 128, 8) 
+
+    # Callbacks
+    ckpt_path = os.path.join(output_dir, "diff_ckpt")
+    ckpt = ModelCheckpoint(
+        ckpt_path,
+        save_best_only=True,
+        monitor='val_mae',
+        mode='min',
+        verbose=1,
+        save_format='tf'  # Use TensorFlow SavedModel format
+    )
+    es = EarlyStopping(
+        monitor='val_mae',
+        patience=3,
+        restore_best_weights=True,
+        mode='min'
+    )
     tb = TensorBoard(log_dir=os.path.join(output_dir, 'logs'))
 
+    # Train the model
     history = diffusion_model.fit(
         X_train, Y_train,
         validation_data=(X_val, Y_val),
@@ -587,10 +657,9 @@ def train_diffusion_for_classical_style(df_classical, diffusion_model, tokenizer
         batch_size=batch_size,
         callbacks=[ckpt, es, tb]
     )
-    final_path = os.path.join(output_dir, "diffusion_final.h5")
-    diffusion_model.save_weights(final_path)
-    print(f"[INFO] Diffusion final weights saved to {final_path}")
+
     return diffusion_model, history
+
 
 ###############################################################################
 #                             Evaluation Metrics
@@ -629,34 +698,68 @@ def compare_with_baselines(results):
 #                           Generation Pipeline
 ###############################################################################
 
-def generate_classical_poem(modern_poem, transformer_model, tokenizer, diffusion_model,
-                            max_length=128):
+# Create a reverse mapping dictionary
+reverse_token_mapping = {tuple(v): token for v, token in zip(encoding_combination, lettersTashkeelCombination)}
+
+def decode_refined_vectors(refined_vectors):
     """
-    1) Use the transformer to convert modern → classical (rough).
-    2) Convert that text to embeddings, feed to diffusion model for refinement.
-    3) Decode back to text.
+    Decodes refined vectors back to their corresponding tokens.
+    
+    Args:
+        refined_vectors (np.ndarray): Array of shape (128, 8).
+    
+    Returns:
+        list: List of decoded tokens.
     """
-    # Step 1
+    tokens = []
+    for vec in refined_vectors:
+        vec_tuple = tuple(vec)
+        token = reverse_token_mapping.get(vec_tuple, 'UNK')  # 'UNK' for unknown vectors
+        tokens.append(token)
+    return tokens
+
+
+def generate_classical_poem(modern_poem, transformer_model, tokenizer, diffusion_model, max_length=128):
+    """
+    Generates a classical poem from a modern poem using a Transformer and a diffusion model.
+    
+    Args:
+        modern_poem (str): The modern poem text.
+        transformer_model (tf.keras.Model): The trained Transformer model.
+        tokenizer (transformers.PreTrainedTokenizer): The tokenizer used by the Transformer.
+        diffusion_model (tf.keras.Model): The trained diffusion model.
+        max_length (int): Maximum sequence length.
+    
+    Returns:
+        str: The generated classical poem.
+    """
+    # Step 1: Transformer generates a rough classical poem
     classical_draft = inference_convert_modern_to_classical(
         modern_verse=modern_poem,
         tokenizer=tokenizer,
         model=transformer_model,
         max_length=max_length
     )
-    # Step 2
-    enc = tokenizer(
-        classical_draft,
-        max_length=max_length,
-        truncation=True,
-        padding='max_length',
-        return_tensors='tf'
-    )
-    draft_ids = enc['input_ids']  # shape: (1, max_length)
-    refined_ids = diffusion_model.predict(draft_ids)
-    # Step 3
-    refined_ids = np.rint(refined_ids).astype(int).clip(min=0)
-    refined_poem = tokenizer.decode(refined_ids[0], skip_special_tokens=True)
+    
+    # Step 2: Vectorize the generated draft for diffusion model
+    vectorized_draft = string_with_tashkeel_vectorizer(classical_draft, max_length)
+    vectorized_draft = vectorized_draft.reshape(1, max_length, encoding_dim)  # Shape: (1, 128, 8)
+    
+    # Step 3: Diffusion model refines the token IDs
+    refined_vectors = diffusion_model.predict(vectorized_draft)
+    
+    # Post-processing: Round and clip the predicted vectors to binary
+    refined_vectors = np.rint(refined_vectors).astype(int).clip(min=0, max=1)  # Ensures binary vectors
+    
+    # Step 4: Decode the refined vectors back to tokens
+    refined_tokens = decode_refined_vectors(refined_vectors[0])
+    
+    # Reconstruct the poem from tokens
+    refined_poem = ''.join(refined_tokens).strip()
+    
     return refined_poem
+
+
 
 ###############################################################################
 #                     Sequence-based Batch Generator
@@ -889,13 +992,13 @@ def train_masked_language_model(texts, model_name="aubmindlab/bert-base-arabertv
 
     def gen_train():
         for batch in train_dataset:
-            features = data_collator.torch_call(batch)
+            features = data_collator(batch)
             yield ({"input_ids": features["input_ids"], "attention_mask": features["attention_mask"]},
                    features["labels"])
 
     def gen_val():
         for batch in val_dataset:
-            features = data_collator.torch_call(batch)
+            features = data_collator(batch)
             yield ({"input_ids": features["input_ids"], "attention_mask": features["attention_mask"]},
                    features["labels"])
 
@@ -1063,3 +1166,164 @@ def train_poetic_rl(model_name="aubmindlab/aragpt2-base",
     tokenizer.save_pretrained("./poetic_rl_model")
     return model, tokenizer
 
+###############################################################################
+#                  Example Usage (Similar to your old sample code)
+###############################################################################
+if __name__ == "__main__":
+    """
+    This block shows a usage example similar to your old sample. 
+    Adjust file paths, data columns, hyperparams, etc. as needed.
+    """
+
+    # Example: Suppose we have processed CSV data for classical Taweel poems
+    processed_data_path = '../data/processed/processed_taweel_data.csv'
+    diffusion_output_dir = '../models/diffusion'
+    transformer_output_dir = '../models/transformers'
+
+    os.makedirs(diffusion_output_dir, exist_ok=True)
+    os.makedirs(transformer_output_dir, exist_ok=True)
+
+    # Load processed data
+    print("Loading processed data...")
+    processed_df = pd.read_csv(processed_data_path, encoding='utf-8-sig')
+    print(f"Processed data loaded with {len(processed_df)} records.")
+
+    # Optional: subset for quick tests
+    subset = True
+    if subset:
+        print("Using subset for testing...")
+        train_df, valid_df = train_test_split(processed_df, test_size=0.2, random_state=42)
+        train_subset = train_df.sample(n=100, random_state=42)
+        valid_subset = valid_df.sample(n=20, random_state=42)
+    else:
+        train_df, valid_df = train_test_split(processed_df, test_size=0.2, random_state=42)
+        train_subset, valid_subset = train_df, valid_df
+
+    print(f"Training records: {len(train_subset)}; Validation records: {len(valid_subset)}")
+
+    # Transformer Model Training (Auto-Encoder Style)
+    print("Training Transformer in auto-encoder style for classical poems...")
+    tokenizer_name = "t5-small"  # Changed to T5-based model
+    tok = AutoTokenizer.from_pretrained(tokenizer_name)
+
+    transformer_model = create_transformer_for_classical_style(model_name=tokenizer_name, max_length=128)
+
+    # Prepare training data
+    sub_df = train_subset[['text']].copy()
+
+    # Train the Transformer
+    trained_transformer, hist = train_transformer_for_classical_style(
+        df_classical=sub_df,
+        tokenizer=tok,
+        model=transformer_model,
+        max_length=128,
+        epochs=3,           # Adjust epochs as needed
+        batch_size=2,       # Adjust batch size based on GPU memory
+        output_dir=transformer_output_dir
+    )
+    print("Transformer training complete.")
+    '''
+    # Save the final model
+    final_model_path = os.path.join(transformer_output_dir, "auto_encoder_transformer_model_final.h5")
+    trained_transformer.save_weights(final_model_path)
+    print(f"Final Transformer model saved to {final_model_path}")
+
+    # Save the tokenizer correctly
+    tokenizer_output_path = os.path.join(transformer_output_dir, "tokenizer")
+    tok.save_pretrained(tokenizer_output_path)
+    print(f"Tokenizer saved to {tokenizer_output_path}")
+    
+    '''
+
+
+    # Optional: Plot Training History
+    plt.figure(figsize=(10, 4))
+    plt.plot(hist.history['loss'], label='Train Loss')
+    plt.plot(hist.history['val_loss'], label='Validation Loss')
+    plt.title("Transformer Auto-Encoder Training Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.show()
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(hist.history['accuracy'], label='Train Accuracy')
+    plt.plot(hist.history['val_accuracy'], label='Validation Accuracy')
+    plt.title("Transformer Auto-Encoder Training Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.show()
+
+    # Diffusion Model Example
+    # Assume each verse is up to 1000 characters, each char is vectorized into 8 bits
+    max_bayt_len = 1000
+    encoding_dim = 8
+    input_shape = (max_bayt_len, encoding_dim)
+    diffusion_model_params = {
+        'num_transformer_blocks': 4,
+        'num_heads': 8,
+        'key_dim': 64,
+        'ffn_units': 512
+    }
+    print("Creating diffusion model...")
+    diffusion_model = create_diffusion_model(input_shape, diffusion_model_params)
+
+    print("Vectorizing training and validation data...")
+    X_train_enc = string_with_tashkeel_vectorizer_per_batch(pd.Series(train_subset['text']), max_bayt_len)
+    Y_train_enc = X_train_enc.copy()
+    X_valid_enc = string_with_tashkeel_vectorizer_per_batch(pd.Series(valid_subset['text']), max_bayt_len)
+    Y_valid_enc = X_valid_enc.copy()
+
+    X_train_enc = np.array(X_train_enc)
+    Y_train_enc = np.array(Y_train_enc)
+    X_valid_enc = np.array(X_valid_enc)
+    Y_valid_enc = np.array(Y_valid_enc)
+
+    batch_size = 8
+    epochs = 5
+    print("Training diffusion model (example)...")
+    ckpt_path = os.path.join(diffusion_output_dir, "diff_ckpt.h5")
+    ckpt = ModelCheckpoint(ckpt_path, save_best_only=True,
+                           monitor='val_mae', mode='min', verbose=1)
+    es = EarlyStopping(monitor='val_mae', patience=2, restore_best_weights=True, mode='min')
+    tb = TensorBoard(log_dir=os.path.join(diffusion_output_dir, 'logs'))
+
+    diffusion_history = diffusion_model.fit(
+        X_train_enc, Y_train_enc,
+        validation_data=(X_valid_enc, Y_valid_enc),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=[ckpt, es, tb]
+    )
+
+    final_diffusion_path = os.path.join(diffusion_output_dir, "diffusion_model_final.h5")
+    diffusion_model.save_weights(final_diffusion_path)
+    print(f"Final diffusion model saved to {final_diffusion_path}")
+
+    # Plot Diffusion Model Training History
+    plt.figure(figsize=(10, 4))
+    plt.plot(diffusion_history.history['loss'], label='Train Loss')
+    plt.plot(diffusion_history.history['val_loss'], label='Val Loss')
+    plt.legend()
+    plt.title("Diffusion Model Loss")
+    plt.show()
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(diffusion_history.history['mae'], label='Train MAE')
+    plt.plot(diffusion_history.history['val_mae'], label='Val MAE')
+    plt.legend()
+    plt.title("Diffusion Model MAE")
+    plt.show()
+
+    # Example: Inference - Generate and Refine a Poem
+    modern_poem = "يا ليل الصب متى غده"  # Replace with your modern poem
+    classical_poem = generate_classical_poem(
+        modern_poem,
+        transformer_model=trained_transformer,
+        tokenizer=tok,
+        diffusion_model=diffusion_model,
+        max_length=128
+    )
+    print("Generated Classical Poem:")
+    print(classical_poem)
