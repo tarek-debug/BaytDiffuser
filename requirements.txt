@@ -11,3 +11,4 @@ transformers
 torch  # Required by some transformer models
 matplotlib
 seaborn
+tensorflow-addons
