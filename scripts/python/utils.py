@@ -1,4 +1,4 @@
-# utils.py
+# imports.py
 
 import os
 import re
@@ -15,6 +15,7 @@ from functools import partial, update_wrapper
 from itertools import product
 import unicodedata
 from difflib import SequenceMatcher
+from tqdm import tqdm  # For progress bars
 
 # PyTorch and related libraries
 import torch
@@ -26,9 +27,7 @@ from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-
 # matplotlib
-
 import matplotlib.pyplot as plt
 
 # Scikit-learn
@@ -44,17 +43,16 @@ from transformers import (
     AutoModelForMaskedLM,
     DataCollatorForLanguageModeling,
     pipeline,
-    AutoModelForCausalLM
+    AutoModelForCausalLM,
+    GPT2Tokenizer
 )
+from arabert import ArabertPreprocessor
+from arabert.aragpt2.grover.modeling_gpt2 import GPT2LMHeadModel
 
 import subprocess
 
 # Arabic-specific modules
 import pyarabic.araby as araby
-
-# utils_pytorch.py
-
-
 
 
 
@@ -136,7 +134,6 @@ class Arabic:
         waw_hamza, alef_hamza_below, yeh_hamza, alef_maksura, teh_marbuta
     ]
     tashkeel = [fathatan, dammatan, kasratan, fatha, damma, kasra, sukun, shadda]
-
 
 AR = Arabic()
 
@@ -247,16 +244,16 @@ def transliterate_arabic_to_syllables(verse):
     """
     verse = normalize_arabic(verse)
     syllables = []
-    vowels_short = ['َ', 'ِ', 'ُ']
-    vowels_long = ['ا', 'و', 'ي']
-    shadda = 'ّ'
-    sukun = 'ْ'
+    vowels_short = [AR.fatha, AR.kasra, AR.damma]
+    vowels_long = [AR.alef, AR.waw, AR.yeh]
+    shadda = AR.shadda
+    sukun = AR.sukun
 
     i = 0
     while i < len(verse):
         char = verse[i]
         next_char = verse[i+1] if i+1 < len(verse) else ''
-        if re.match(r'[\u0621-\u064A]', char) and char not in vowels_long:
+        if char in AR.alphabet and char not in vowels_long:
             if next_char == shadda:
                 syllables.append('―')
                 i += 2
@@ -442,7 +439,11 @@ def encode_classes_data(categories):
 def decode_classes(onehot_vec, encoder):
     idx = np.argmax(onehot_vec)
     return encoder.inverse_transform([idx])[0]
-    
+
+###############################################################################
+#                      Transformer (AraGPT2) Auto-Encoding for Classical Style
+###############################################################################
+
 ###############################################################################
 #                      Transformer (AraGPT2) Auto-Encoding for Classical Style
 ###############################################################################
@@ -515,7 +516,7 @@ class AraGPT2ForClassicalStyle(nn.Module):
         return model_instance
 
 def train_aragpt2_for_classical_style(df_classical, tokenizer, model,
-                                      max_length=128, epochs=10, batch_size=4,
+                                      max_length=128, epochs=10, batch_size=8,
                                       output_dir='./transformer_output', device='cuda' if torch.cuda.is_available() else 'cpu',
                                       freeze_layers=0, weight_decay=0.01, 
                                       patience=3, max_grad_norm=1.0):
@@ -537,112 +538,112 @@ def train_aragpt2_for_classical_style(df_classical, tokenizer, model,
         max_grad_norm (float): Maximum norm for gradient clipping.
 
     Returns:
-        model: Trained AraGPT2 model.
-        history: Training history dictionary containing loss and perplexity metrics.
+        AraGPT2ForClassicalStyle: Trained AraGPT2 model.
+        dict: Training history dictionary containing loss and perplexity metrics.
     """
-    import os
-    from sklearn.model_selection import train_test_split
-    from torch.optim.lr_scheduler import ReduceLROnPlateau
+    import torch
+    from torch.utils.tensorboard import SummaryWriter
 
+    os.makedirs(output_dir, exist_ok=True)
+    
     # Prepare the data
     texts = df_classical['text'].tolist()
+    # Preprocess texts
+    preprocessed_texts = preprocess_texts(texts, preprocessor)
+    
     encodings = tokenizer(
-        texts, 
+        preprocessed_texts, 
         max_length=max_length, 
         padding='max_length', 
         truncation=True,
         return_tensors='pt'
     )
-    input_ids = encodings['input_ids']
+    input_ids = encodings['input_ids']  # Shape: (num_samples, seq_len)
     attention_mask = encodings['attention_mask']
+    
+    # Shift labels for next-token prediction handled internally by the model
     labels = input_ids.clone()
     labels[:, :-1] = input_ids[:, 1:].clone()
     labels[:, -1] = tokenizer.eos_token_id
-
-    # Split the data into training and validation sets
+    
+    # Create Dataset and DataLoader
     dataset = torch.utils.data.TensorDataset(input_ids, attention_mask, labels)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-
-    # Create DataLoaders
+    
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
+    
     # Move model to device
     model.to(device)
-
-    # Define optimizer with weight decay
+    
+    # Define optimizer and scheduler
     optimizer = Adam(model.parameters(), lr=5e-5, weight_decay=weight_decay)
-
-    # Define learning rate scheduler without the deprecated 'verbose' parameter
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2)
-
+    
     # Define loss function
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
-
-    # Prepare for training
-    history = {'train_loss': [], 'val_loss': [], 'train_perplexity': [], 'val_perplexity': []}
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    
+    # TensorBoard writer
+    writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
+    
+    # Training Loop with Early Stopping and Checkpointing
     best_val_loss = float('inf')
     epochs_no_improve = 0
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Initialize current_lr for tracking changes
-    current_lr = optimizer.param_groups[0]['lr']
-
-    for epoch in range(epochs):
+    history = {'train_loss': [], 'val_loss': [], 'train_perplexity': [], 'val_perplexity': []}
+    
+    for epoch in range(1, epochs + 1):
         model.train()
-        total_loss = 0
-
-        for batch in train_loader:
+        total_loss = 0.0
+        for batch in tqdm(train_loader, desc=f"Training Epoch {epoch}"):
             input_ids_batch, attention_mask_batch, labels_batch = [b.to(device) for b in batch]
+            
             optimizer.zero_grad()
+            # Forward pass
             loss, logits = model(input_ids=input_ids_batch, attention_mask=attention_mask_batch, labels=labels_batch)
             loss.backward()
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
+            
             total_loss += loss.item() * input_ids_batch.size(0)
-
-        avg_train_loss = total_loss / len(train_loader.dataset)
+        
+        avg_train_loss = total_loss / train_size
         train_perplexity = math.exp(avg_train_loss) if avg_train_loss < 20 else float('inf')
-        history['train_loss'].append(avg_train_loss)
-        history['train_perplexity'].append(train_perplexity)
-
+        
         # Validation
         model.eval()
-        val_loss = 0
+        val_loss = 0.0
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in tqdm(val_loader, desc=f"Validation Epoch {epoch}"):
                 input_ids_batch, attention_mask_batch, labels_batch = [b.to(device) for b in batch]
                 loss, logits = model(input_ids=input_ids_batch, attention_mask=attention_mask_batch, labels=labels_batch)
                 val_loss += loss.item() * input_ids_batch.size(0)
-
-        avg_val_loss = val_loss / len(val_loader.dataset)
+        
+        avg_val_loss = val_loss / val_size
         val_perplexity = math.exp(avg_val_loss) if avg_val_loss < 20 else float('inf')
+        
+        # Logging
+        print(f"Epoch {epoch}/{epochs} | Train Loss: {avg_train_loss:.4f} | Train Perplexity: {train_perplexity:.2f} | Val Loss: {avg_val_loss:.4f} | Val Perplexity: {val_perplexity:.2f}")
+        
+        writer.add_scalar('Loss/Train', avg_train_loss, epoch)
+        writer.add_scalar('Loss/Validation', avg_val_loss, epoch)
+        writer.add_scalar('Perplexity/Train', train_perplexity, epoch)
+        writer.add_scalar('Perplexity/Validation', val_perplexity, epoch)
+        
+        history['train_loss'].append(avg_train_loss)
+        history['train_perplexity'].append(train_perplexity)
         history['val_loss'].append(avg_val_loss)
         history['val_perplexity'].append(val_perplexity)
-
-        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Train Perplexity: {train_perplexity:.2f} | Val Loss: {avg_val_loss:.4f} | Val Perplexity: {val_perplexity:.2f}")
-
+        
         # Scheduler step
         scheduler.step(avg_val_loss)
-
-        # Check for learning rate change
-        new_lr = optimizer.param_groups[0]['lr']
-        if new_lr != current_lr:
-            print(f"Learning rate adjusted from {current_lr} to {new_lr}")
-            current_lr = new_lr
-
-        # Checkpointing
+        
+        # Check for improvement
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            checkpoint_dir = os.path.join(output_dir, f"model_epoch_{epoch+1}")
-            # Remove existing directory if it exists as a file
-            if os.path.exists(checkpoint_dir) and os.path.isfile(checkpoint_dir):
-                os.remove(checkpoint_dir)
-                print(f"Removed existing file at '{checkpoint_dir}' to create directory.")
+            checkpoint_dir = os.path.join(output_dir, f"model_epoch_{epoch}")
             model.save_pretrained(checkpoint_dir)
             print(f"Saved best model to '{checkpoint_dir}'")
             epochs_no_improve = 0
@@ -652,7 +653,10 @@ def train_aragpt2_for_classical_style(df_classical, tokenizer, model,
             if epochs_no_improve >= patience:
                 print("Early stopping triggered.")
                 break
-
+    
+    # Close TensorBoard writer
+    writer.close()
+    
     print("Training complete.")
     return model, history
 
@@ -694,6 +698,329 @@ def inference_convert_classical(classical_verse, tokenizer, model, max_length=12
     
     refined_verse = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     return refined_verse
+
+###############################################################################
+#                        Diffusion Model in PyTorch
+###############################################################################
+
+class TransformerBlock(nn.Module):
+    def __init__(self, input_dim, num_heads, key_dim, ffn_units):
+        """
+        Initializes a single Transformer block.
+
+        Args:
+            input_dim (int): Dimension of the input features.
+            num_heads (int): Number of attention heads.
+            key_dim (int): Dimension of the keys in attention.
+            ffn_units (int): Number of units in the feed-forward network.
+        """
+        super(TransformerBlock, self).__init__()
+        self.attention = nn.MultiheadAttention(embed_dim=input_dim, num_heads=num_heads, batch_first=True)
+        self.layer_norm1 = nn.LayerNorm(input_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(input_dim, ffn_units),
+            nn.ReLU(),
+            nn.Linear(ffn_units, input_dim)
+        )
+        self.layer_norm2 = nn.LayerNorm(input_dim)
+    
+    def forward(self, x):
+        """
+        Forward pass through a Transformer block.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_dim)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, input_dim)
+        """
+        # Self-Attention with Residual Connection
+        attn_output, _ = self.attention(x, x, x)
+        x = self.layer_norm1(x + attn_output)
+        
+        # Feed-Forward Network with Residual Connection
+        ffn_output = self.ffn(x)
+        x = self.layer_norm2(x + ffn_output)
+        
+        return x
+
+
+class DiffusionModel(nn.Module):
+    def __init__(self, input_dim, model_params):
+        """
+        Initializes the Diffusion Model with Transformer blocks.
+
+        Args:
+            input_dim (int): Dimension of the input features.
+            model_params (dict): Dictionary containing model parameters:
+                - num_transformer_blocks (int)
+                - num_heads (int)
+                - key_dim (int)
+                - ffn_units (int)
+        """
+        super(DiffusionModel, self).__init__()
+        self.input_dim = input_dim
+        self.num_transformer_blocks = model_params.get('num_transformer_blocks', 2)
+        self.num_heads = model_params.get('num_heads', 4)
+        self.key_dim = model_params.get('key_dim', 64)
+        self.ffn_units = model_params.get('ffn_units', 256)
+        
+        # Initial LayerNorm
+        self.initial_norm = nn.LayerNorm(input_dim)
+        
+        # Transformer Blocks
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(
+                input_dim=input_dim,
+                num_heads=self.num_heads,
+                key_dim=self.key_dim,
+                ffn_units=self.ffn_units
+            )
+            for _ in range(self.num_transformer_blocks)
+        ])
+        
+        # Output Layer
+        self.output_layer = nn.Linear(input_dim, input_dim)
+    
+    def forward(self, x):
+        """
+        Forward pass through the Diffusion Model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_dim)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, input_dim)
+        """
+        x = self.initial_norm(x)
+        for block in self.transformer_blocks:
+            x = block(x)
+        x = self.output_layer(x)
+        return x
+
+def embed_tokens_pytorch(input_ids, max_bayt_len, encoding_dim):
+    """
+    Embeds input IDs by repeating them along the last dimension.
+
+    Args:
+        input_ids (torch.Tensor): Tensor of shape (batch_size, seq_len)
+        max_bayt_len (int): Maximum sequence length.
+        encoding_dim (int): Dimension to repeat each token.
+
+    Returns:
+        torch.Tensor: Embedded tensor of shape (batch_size, max_bayt_len, encoding_dim)
+    """
+    batch_size, seq_len = input_ids.size()
+    if seq_len < max_bayt_len:
+        padding = torch.zeros((batch_size, max_bayt_len - seq_len), dtype=input_ids.dtype, device=input_ids.device)
+        input_ids_padded = torch.cat([input_ids, padding], dim=1)
+    else:
+        input_ids_padded = input_ids[:, :max_bayt_len]
+
+    # Repeat the input IDs along the last dimension and cast to float
+    embedded = input_ids_padded.unsqueeze(-1).repeat(1, 1, encoding_dim).float()
+    return embedded
+
+
+class DiffusionModelWithDecoder(nn.Module):
+    def __init__(self, diffusion_model, gpt2_model_name='aubmindlab/aragpt2-base'):
+        """
+        Initializes the Diffusion Model with AraGPT2 as the decoder.
+
+        Args:
+            diffusion_model (nn.Module): The original diffusion model.
+            gpt2_model_name (str): HuggingFace model name for AraGPT2.
+        """
+        super(DiffusionModelWithDecoder, self).__init__()
+        self.diffusion_model = diffusion_model
+        self.decoder = AutoModelForCausalLM.from_pretrained(gpt2_model_name)
+        self.tokenizer = GPT2Tokenizer.from_pretrained(gpt2_model_name)
+        
+        # Optionally freeze GPT2 parameters if you don't want to fine-tune them
+        # for param in self.decoder.parameters():
+        #     param.requires_grad = False
+
+        # Check if a projection layer is needed
+        diffusion_output_dim = self.diffusion_model.output_layer.out_features  # Assuming last layer output
+        gpt2_embedding_dim = self.decoder.transformer.wte.embedding_dim
+        if diffusion_output_dim != gpt2_embedding_dim:
+            self.projection = nn.Linear(diffusion_output_dim, gpt2_embedding_dim)
+            print(f"Projection layer added: {diffusion_output_dim} -> {gpt2_embedding_dim}")
+        else:
+            self.projection = None
+            print("No projection layer needed; dimensions match.")
+    
+    def forward(self, x, labels=None):
+        """
+        Forward pass through the diffusion model and decoder.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, encoding_dim)
+            labels (torch.Tensor, optional): Labels for language modeling.
+
+        Returns:
+            transformers.modeling_outputs.CausalLMOutputWithCrossAttentions: Outputs containing loss and logits if labels are provided.
+        """
+        # Pass through diffusion model
+        refined_embeddings = self.diffusion_model(x)  # Shape: (batch_size, seq_len, encoding_dim)
+
+        # Project embeddings if necessary
+        if self.projection:
+            refined_embeddings = self.projection(refined_embeddings)  # Shape: (batch_size, seq_len, gpt2_embedding_dim)
+
+        # Pass the embeddings directly to GPT2's transformer
+        outputs = self.decoder(inputs_embeds=refined_embeddings, labels=labels)
+        return outputs  # Contains loss and logits if labels are provided
+def train_diffusion_with_gpt2_decoder(
+    df_classical, 
+    diffusion_model, 
+    tokenizer, 
+    preprocessor,
+    max_length=128, 
+    max_bayt_len=128, 
+    encoding_dim=8,
+    epochs=10, 
+    batch_size=8, 
+    output_dir='./diffusion_output_with_decoder',
+    learning_rate=1e-4, 
+    patience=3, 
+    device='cuda' if torch.cuda.is_available() else 'cpu'
+):
+    """
+    Trains the Diffusion Model with AraGPT2 Decoder in PyTorch for classical style refinement.
+
+    Args:
+        df_classical (pd.DataFrame): DataFrame containing classical poems with a 'text' column.
+        diffusion_model (nn.Module): Initialized Diffusion Model.
+        tokenizer (transformers.PreTrainedTokenizer): Tokenizer to process the text.
+        preprocessor (ArabertPreprocessor): Preprocessor for Arabic text.
+        max_length (int): Maximum sequence length for tokenization.
+        max_bayt_len (int): Maximum sequence length after embedding.
+        encoding_dim (int): Dimension to embed each token.
+        epochs (int): Number of training epochs.
+        batch_size (int): Batch size for training.
+        output_dir (str): Directory to save model checkpoints.
+        learning_rate (float): Learning rate for the optimizer.
+        patience (int): Number of epochs with no improvement for early stopping.
+        device (str): Device to train on ('cuda' or 'cpu').
+
+    Returns:
+        nn.Module: Trained Diffusion Model with Decoder.
+        dict: Training history containing loss metrics.
+    """
+    import torch
+    from torch.utils.tensorboard import SummaryWriter
+
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Initialize the combined model
+    combined_model = DiffusionModelWithDecoder(diffusion_model).to(device)
+    
+    # Prepare the data
+    texts = df_classical['text'].tolist()
+    # Preprocess texts
+    preprocessed_texts = preprocess_texts(texts, preprocessor)
+    
+    encodings = tokenizer(
+        preprocessed_texts, 
+        max_length=max_length, 
+        padding='max_length', 
+        truncation=True,
+        return_tensors='pt'
+    )
+    input_ids = encodings['input_ids']  # Shape: (num_samples, seq_len)
+    attention_mask = encodings['attention_mask']
+    
+    # Shift labels for next-token prediction handled internally by the decoder
+    labels = input_ids.clone()
+    labels[:, :-1] = input_ids[:, 1:].clone()
+    labels[:, -1] = tokenizer.eos_token_id
+    
+    # Embed tokens
+    embedded_X = embed_tokens_pytorch(input_ids, max_bayt_len, encoding_dim)  # Shape: (num_samples, max_bayt_len, encoding_dim)
+    
+    # Create Dataset and DataLoader
+    dataset_with_labels = DiffusionDatasetWithLabels(embedded_X, input_ids)
+    train_size = int(0.8 * len(dataset_with_labels))
+    val_size = len(dataset_with_labels) - train_size
+    train_dataset, val_dataset = random_split(dataset_with_labels, [train_size, val_size])
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Define optimizer and loss function
+    optimizer = Adam(combined_model.parameters(), lr=learning_rate)
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)  # Suitable for token prediction
+    
+    # TensorBoard writer
+    writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
+    
+    # Training Loop with Early Stopping and Checkpointing
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    history = {'train_loss': [], 'val_loss': []}
+    
+    for epoch in range(1, epochs + 1):
+        combined_model.train()
+        train_loss = 0.0
+        for batch_X, batch_labels in tqdm(train_loader, desc=f"Training Epoch {epoch}"):
+            batch_X = batch_X.to(device)        # Shape: (batch_size, seq_len, encoding_dim)
+            batch_labels = batch_labels.to(device)  # Shape: (batch_size, seq_len)
+            
+            optimizer.zero_grad()
+            # Forward pass with labels
+            outputs = combined_model(batch_X, labels=batch_labels)
+            loss = outputs.loss  # CrossEntropyLoss
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item() * batch_X.size(0)
+        
+        avg_train_loss = train_loss / train_size
+        
+        # Validation
+        combined_model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch_X, batch_labels in tqdm(val_loader, desc=f"Validation Epoch {epoch}"):
+                batch_X = batch_X.to(device)
+                batch_labels = batch_labels.to(device)
+                
+                outputs = combined_model(batch_X, labels=batch_labels)
+                loss = outputs.loss
+                val_loss += loss.item() * batch_X.size(0)
+        
+        avg_val_loss = val_loss / val_size
+        
+        # Logging
+        print(f"Epoch {epoch}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        
+        writer.add_scalar('Loss/Train', avg_train_loss, epoch)
+        writer.add_scalar('Loss/Validation', avg_val_loss, epoch)
+        
+        history['train_loss'].append(avg_train_loss)
+        history['val_loss'].append(avg_val_loss)
+        
+        # Check for improvement
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            checkpoint_path = os.path.join(output_dir, f"diffusion_model_epoch_{epoch}.pt")
+            torch.save(combined_model.state_dict(), checkpoint_path)
+            print(f"Saved best model to '{checkpoint_path}'")
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            print(f"No improvement in validation loss for {epochs_no_improve} epoch(s).")
+            if epochs_no_improve >= patience:
+                print("Early stopping triggered.")
+                break
+    
+    # Close TensorBoard writer
+    writer.close()
+    
+    print("Training complete.")
+    return combined_model, history
+
 
 ###############################################################################
 #            NEW: ThePoet Integration (mabaji/thepoet) for Initial Gen
@@ -739,7 +1066,6 @@ def add_tashkeel_with_java(verse):
         os.chdir(original_cwd)
 
 
-
 def create_thepoet_pipeline():
     """
     Creates a text-generation pipeline using the mabaji/thepoet model 
@@ -748,13 +1074,13 @@ def create_thepoet_pipeline():
     poet_tokenizer = AutoTokenizer.from_pretrained("mabaji/thepoet")
     poet_model = AutoModelForCausalLM.from_pretrained("mabaji/thepoet")
     poet_model.to('cuda' if torch.cuda.is_available() else 'cpu')
-    poet_pipeline = pipeline(
+    poet_pipeline_instance = pipeline(
         "text-generation", 
         model=poet_model, 
         tokenizer=poet_tokenizer,
         device=0 if torch.cuda.is_available() else -1
     )
-    return poet_pipeline
+    return poet_pipeline_instance
 
 
 def generate_rough_poem_with_thepoet(prompt, poet_pipeline, max_length=50, num_return_sequences=1, max_attempts=10):
@@ -912,12 +1238,13 @@ def generate_classical_poem_with_thepoet(
     poet_pipeline,
     transformer_model,
     transformer_tokenizer,
-    # diffusion_model,  # Removed as we're skipping Diffusion
+    diffusion_model=None,  # Diffusion model is optional
+    diffusion_tokenizer=None,  # Tokenizer for diffusion model if needed
     max_length=128,
     device='cuda' if torch.cuda.is_available() else 'cpu'
 ):
     """
-    Generates a refined classical Arabic poem by chaining ThePoet and AraGPT2.
+    Generates a refined classical Arabic poem by chaining ThePoet, AraGPT2, and Diffusion Model.
 
     Steps:
     1. Generate a rough poem using ThePoet.
@@ -932,7 +1259,8 @@ def generate_classical_poem_with_thepoet(
         poet_pipeline (transformers.pipeline): ThePoet pipeline for initial generation.
         transformer_model (AraGPT2ForClassicalStyle): Fine-tuned AraGPT2 model.
         transformer_tokenizer (AutoTokenizer): Tokenizer for AraGPT2.
-        diffusion_model (tf.keras.Model, optional): Diffusion model for further refinement.
+        diffusion_model (DiffusionModelWithDecoder, optional): Trained Diffusion model with Decoder.
+        diffusion_tokenizer (AutoTokenizer, optional): Tokenizer for diffusion model if needed.
         max_length (int): Maximum sequence length for models.
         device (str): Device to perform inference on.
 
@@ -1006,433 +1334,49 @@ def generate_classical_poem_with_thepoet(
         )
         print(f"Classical Draft from AraGPT2: {classical_draft}")
 
-        # **Removed Step 4d: Diffusion Refinement**
-        # Since we're skipping the Diffusion model, we directly use the Transformer output.
-
-        # Optionally, you can still pass the classical_draft through `filter_arabic` if needed
-        final_verse = filter_arabic(classical_draft)
-        print(f"Final Verse after AraGPT2 Refinement: {final_verse}")
+        # Step 4d: Diffusion Model Refinement (Optional)
+        if diffusion_model is not None:
+            print("Passing verse through Diffusion Model for further refinement...")
+            # Vectorize the refined verse
+            diffusion_input_enc = diffusion_tokenizer(
+                classical_draft,
+                max_length=max_length,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            diffusion_input_ids = diffusion_input_enc['input_ids'].to(device)
+            diffusion_attention_mask = diffusion_input_enc['attention_mask'].to(device)
+            
+            # Embed tokens
+            diffusion_embeddings = embed_tokens_pytorch(diffusion_input_ids, max_bayt_len, encoding_dim).to(device)  # Shape: (batch_size, seq_len, encoding_dim)
+            
+            # Pass through the combined diffusion model with decoder
+            with torch.no_grad():
+                outputs = diffusion_model(diffusion_embeddings, labels=diffusion_input_ids)
+                # outputs contains loss and logits
+                # To get the refined text, we can generate text based on the refined embeddings
+                # However, generate is not directly compatible, so we need to handle it differently
+                # For demonstration, we'll decode using the logits
+                logits = outputs.logits  # Shape: (batch_size, seq_len, vocab_size)
+                predicted_ids = torch.argmax(logits, dim=-1)
+                refined_text = diffusion_tokenizer.decode(predicted_ids[0], skip_special_tokens=True)
+                print(f"Final Verse after Diffusion Refinement: {refined_text}")
+        else:
+            # If diffusion model is not used
+            refined_text = classical_draft
+            print(f"Final Verse after AraGPT2 Refinement: {refined_text}")
 
         # Append to processed verses
-        if final_verse:
-            processed_verses.append(final_verse)
+        if refined_text:
+            processed_verses.append(refined_text)
         else:
-            print(f"Warning: Final verse {idx} is empty after AraGPT2 refinement.")
+            print(f"Warning: Final verse {idx} is empty after refinement.")
 
     # Step 5: Combine into final poem
     final_poem = '\n'.join(processed_verses)
     print(f"\n==== Final Chained Poem ====\n{final_poem}\n================================")
     return final_poem
-
-###############################################################################
-#                     Sequence-based Batch Generator
-###############################################################################
-
-class ShaarDataset(Dataset):
-    def __init__(self, bayt_texts, bhore_texts, vectorize_fun, max_bayt_len):
-        self.bayt_texts = bayt_texts.reset_index(drop=True)
-        self.bhore_texts = bhore_texts
-        self.vectorize_fun = vectorize_fun
-        self.max_bayt_len = max_bayt_len
-
-    def __len__(self):
-        return len(self.bayt_texts)
-
-    def __getitem__(self, idx):
-        batch_text = self.bayt_texts[idx]
-        batch_y = self.bhore_texts[idx]
-        X_enc = self.vectorize_fun(batch_text, self.max_bayt_len)
-        return torch.tensor(X_enc, dtype=torch.float32), torch.tensor(batch_y, dtype=torch.float32)
-
-def get_dataloader(dataset, batch_size=32, shuffle=True):
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
-
-###############################################################################
-#                     Logging and Checkpoint Utilities
-###############################################################################
-
-def update_log_file(exp_name, text, epoch_flag=False):
-    def _update_line(line, newtext, ep_flag):
-        if ep_flag:
-            prefix, epoch_count = line.split("@")
-            epoch_count = str(int(epoch_count) + 1)
-            return prefix + "@" + epoch_count
-        else:
-            prefix = line.split(",")[0]
-            return prefix + "," + newtext
-
-    try:
-        if not os.path.exists("log.txt"):
-            with open("log.txt", 'w') as f:
-                f.write(f"{exp_name}, {text}\n")
-            return True
-
-        lines = open("log.txt").read().split('\n')
-        new_lines = []
-        for line in lines:
-            if not line.strip():
-                new_lines.append(line)
-                continue
-            if exp_name == line.split(",")[0]:
-                new_line = _update_line(line, text, epoch_flag)
-                new_lines.append(new_line)
-            else:
-                new_lines.append(line)
-        with open("log.txt", 'w') as f:
-            f.write('\n'.join(new_lines))
-        return True
-    except Exception as e:
-        print(f"Error updating log file: {e}")
-        return False
-
-def remove_non_max(checkpoints_path):
-    try:
-        models = os.listdir(checkpoints_path)
-        metric_files = []
-        for filename in models:
-            if 'weights-improvement' in filename and filename.endswith('.h5'):
-                parts = filename.split('-')
-                try:
-                    metric = float(parts[-2])
-                    metric_files.append((filename, metric))
-                except:
-                    continue
-        if not metric_files:
-            print("No checkpoint files found to evaluate.")
-            return
-        metric_files_sorted = sorted(metric_files, key=lambda x: x[1])
-        best_file = metric_files_sorted[0][0]
-        print(f"Best checkpoint identified: {best_file}")
-        for file, _ in metric_files_sorted[1:]:
-            os.remove(os.path.join(checkpoints_path, file))
-            print(f"Removed checkpoint: {file}")
-    except Exception as e:
-        print(f"Error in removing non-max checkpoints: {e}")
-
-
-###############################################################################
-#                      Evaluation Utilities
-###############################################################################
-
-def recall_precision_f1(confusion_matrix_df):
-    confusion_matrix_np = confusion_matrix_df.values
-    num_classes = confusion_matrix_np.shape[0]
-    recall_per_class = np.diag(confusion_matrix_np) / np.sum(confusion_matrix_np, axis=1)
-    precision_per_class = np.diag(confusion_matrix_np) / np.sum(confusion_matrix_np, axis=0)
-    recall_per_class = np.nan_to_num(recall_per_class)
-    precision_per_class = np.nan_to_num(precision_per_class)
-    f1_scores = 2 * (precision_per_class * recall_per_class) / (precision_per_class + recall_per_class)
-    f1_scores = np.nan_to_num(f1_scores)
-    f1_score = np.mean(f1_scores)
-    results_df = pd.DataFrame({
-        'Recall': recall_per_class,
-        'Precision': precision_per_class
-    }, index=confusion_matrix_df.index)
-    return results_df, f1_score
-
-
-###############################################################################
-#                          Diffusion Model in PyTorch
-###############################################################################
-
-class DiffusionModel(nn.Module):
-    def __init__(self, input_dim, model_params):
-        """
-        Initializes the Diffusion Model with Transformer blocks.
-
-        Args:
-            input_dim (int): Dimension of the input features.
-            model_params (dict): Dictionary containing model parameters:
-                - num_transformer_blocks (int)
-                - num_heads (int)
-                - key_dim (int)
-                - ffn_units (int)
-        """
-        super(DiffusionModel, self).__init__()
-        self.input_dim = input_dim
-        self.num_transformer_blocks = model_params.get('num_transformer_blocks', 2)
-        self.num_heads = model_params.get('num_heads', 4)
-        self.key_dim = model_params.get('key_dim', 64)
-        self.ffn_units = model_params.get('ffn_units', 256)
-        
-        # Initial LayerNorm
-        self.initial_norm = nn.LayerNorm(input_dim)
-        
-        # Transformer Blocks
-        self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(
-                input_dim=input_dim,
-                num_heads=self.num_heads,
-                key_dim=self.key_dim,
-                ffn_units=self.ffn_units
-            )
-            for _ in range(self.num_transformer_blocks)
-        ])
-        
-        # Output Layer
-        self.output_layer = nn.Linear(input_dim, input_dim)
-    
-    def forward(self, x):
-        """
-        Forward pass through the Diffusion Model.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_dim)
-
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, input_dim)
-        """
-        x = self.initial_norm(x)
-        for block in self.transformer_blocks:
-            x = block(x)
-        x = self.output_layer(x)
-        return x
-
-class TransformerBlock(nn.Module):
-    def __init__(self, input_dim, num_heads, key_dim, ffn_units):
-        """
-        Initializes a single Transformer block.
-
-        Args:
-            input_dim (int): Dimension of the input features.
-            num_heads (int): Number of attention heads.
-            key_dim (int): Dimension of the keys in attention.
-            ffn_units (int): Number of units in the feed-forward network.
-        """
-        super(TransformerBlock, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=input_dim, num_heads=num_heads, batch_first=True)
-        self.layer_norm1 = nn.LayerNorm(input_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(input_dim, ffn_units),
-            nn.ReLU(),
-            nn.Linear(ffn_units, input_dim)
-        )
-        self.layer_norm2 = nn.LayerNorm(input_dim)
-    
-    def forward(self, x):
-        """
-        Forward pass through a Transformer block.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_dim)
-
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, input_dim)
-        """
-        # Self-Attention with Residual Connection
-        attn_output, _ = self.attention(x, x, x)
-        x = self.layer_norm1(x + attn_output)
-        
-        # Feed-Forward Network with Residual Connection
-        ffn_output = self.ffn(x)
-        x = self.layer_norm2(x + ffn_output)
-        
-        return x
-
-def create_diffusion_model_pytorch(input_shape, model_params):
-    """
-    Creates the Diffusion Model in PyTorch.
-
-    Args:
-        input_shape (tuple): Shape of the input (seq_len, encoding_dim)
-        model_params (dict): Parameters for the model architecture.
-
-    Returns:
-        DiffusionModel: An instance of the DiffusionModel class.
-    """
-    seq_len, encoding_dim = input_shape
-    model = DiffusionModel(input_dim=encoding_dim, model_params=model_params)
-    return model
-
-###############################################################################
-#                    Training Function for Diffusion Model
-###############################################################################
-
-class DiffusionDataset(Dataset):
-    def __init__(self, X, Y):
-        """
-        Initializes the Dataset for Diffusion Model.
-
-        Args:
-            X (torch.Tensor): Input tensor of shape (num_samples, seq_len, encoding_dim)
-            Y (torch.Tensor): Target tensor of shape (num_samples, seq_len, encoding_dim)
-        """
-        self.X = X
-        self.Y = Y
-    
-    def __len__(self):
-        return self.X.size(0)
-    
-    def __getitem__(self, idx):
-        return self.X[idx], self.Y[idx]
-
-def embed_tokens_pytorch(input_ids, max_bayt_len, encoding_dim):
-    """
-    Embeds input IDs by repeating them along the last dimension.
-
-    Args:
-        input_ids (torch.Tensor): Tensor of shape (batch_size, seq_len)
-        max_bayt_len (int): Maximum sequence length.
-        encoding_dim (int): Dimension to repeat each token.
-
-    Returns:
-        torch.Tensor: Embedded tensor of shape (batch_size, max_bayt_len, encoding_dim)
-    """
-    batch_size, seq_len = input_ids.size()
-    if seq_len < max_bayt_len:
-        padding = torch.zeros((batch_size, max_bayt_len - seq_len), dtype=input_ids.dtype, device=input_ids.device)
-        input_ids_padded = torch.cat([input_ids, padding], dim=1)
-    else:
-        input_ids_padded = input_ids[:, :max_bayt_len]
-    
-    # Repeat the input IDs along the last dimension
-    embedded = input_ids_padded.unsqueeze(-1).repeat(1, 1, encoding_dim)
-    return embedded
-
-def train_diffusion_for_classical_style_pytorch(df_classical, diffusion_model, tokenizer,
-                                               max_length=128, max_bayt_len=128, encoding_dim=8,
-                                               epochs=5, batch_size=4, output_dir='./diffusion_output',
-                                               learning_rate=1e-3, patience=3, device='cuda' if torch.cuda.is_available() else 'cpu'):
-    """
-    Trains the Diffusion Model in PyTorch for classical style refinement.
-
-    Args:
-        df_classical (pd.DataFrame): DataFrame containing classical poems with a 'text' column.
-        diffusion_model (DiffusionModel): Initialized Diffusion Model.
-        tokenizer (AutoTokenizer): Tokenizer to process the text.
-        max_length (int): Maximum sequence length for tokenization.
-        max_bayt_len (int): Maximum sequence length after embedding.
-        encoding_dim (int): Dimension to embed each token.
-        epochs (int): Number of training epochs.
-        batch_size (int): Batch size for training.
-        output_dir (str): Directory to save model checkpoints.
-        learning_rate (float): Learning rate for the optimizer.
-        patience (int): Number of epochs with no improvement for early stopping.
-        device (str): Device to train on ('cuda' or 'cpu').
-
-    Returns:
-        DiffusionModel: Trained Diffusion Model.
-        dict: Training history containing loss metrics.
-    """
-    import torch
-    import torch.nn as nn
-    from torch.optim import Adam
-    from torch.utils.tensorboard import SummaryWriter
-
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Prepare the data
-    texts = df_classical['text'].tolist()
-    encodings = tokenizer(
-        texts, 
-        max_length=max_length, 
-        padding='max_length', 
-        truncation=True,
-        return_tensors='pt'
-    )
-    input_ids = encodings['input_ids']  # Shape: (num_samples, seq_len)
-    labels = input_ids.clone()
-    
-    # Embed tokens
-    embedded_X = embed_tokens_pytorch(input_ids, max_bayt_len, encoding_dim)  # Shape: (num_samples, max_bayt_len, encoding_dim)
-    embedded_Y = embedded_X.clone()
-    
-    # Create Dataset and DataLoader
-    dataset = DiffusionDataset(embedded_X, embedded_Y)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
-    # Move model to device
-    diffusion_model.to(device)
-    
-    # Define optimizer and loss function
-    optimizer = Adam(diffusion_model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()
-    
-    # TensorBoard writer
-    writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
-    
-    # Training Loop with Early Stopping and Checkpointing
-    best_val_mae = float('inf')
-    epochs_no_improve = 0
-    history = {'train_loss': [], 'val_loss': [], 'train_mae': [], 'val_mae': []}
-    
-    for epoch in range(1, epochs + 1):
-        diffusion_model.train()
-        train_loss = 0.0
-        train_mae = 0.0
-        for batch_X, batch_Y in train_loader:
-            batch_X = batch_X.to(device)  # Shape: (batch_size, max_bayt_len, encoding_dim)
-            batch_Y = batch_Y.to(device)
-            
-            optimizer.zero_grad()
-            outputs = diffusion_model(batch_X)  # Shape: (batch_size, max_bayt_len, encoding_dim)
-            loss = criterion(outputs, batch_Y)
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item() * batch_X.size(0)
-            train_mae += F.l1_loss(outputs, batch_Y, reduction='sum').item()
-        
-        avg_train_loss = train_loss / train_size
-        avg_train_mae = train_mae / train_size
-        
-        # Validation
-        diffusion_model.eval()
-        val_loss = 0.0
-        val_mae = 0.0
-        with torch.no_grad():
-            for batch_X, batch_Y in val_loader:
-                batch_X = batch_X.to(device)
-                batch_Y = batch_Y.to(device)
-                
-                outputs = diffusion_model(batch_X)
-                loss = criterion(outputs, batch_Y)
-                
-                val_loss += loss.item() * batch_X.size(0)
-                val_mae += F.l1_loss(outputs, batch_Y, reduction='sum').item()
-        
-        avg_val_loss = val_loss / val_size
-        avg_val_mae = val_mae / val_size
-        
-        # Logging
-        print(f"Epoch {epoch}/{epochs} | "
-              f"Train Loss: {avg_train_loss:.4f} | Train MAE: {avg_train_mae:.4f} | "
-              f"Val Loss: {avg_val_loss:.4f} | Val MAE: {avg_val_mae:.4f}")
-        
-        writer.add_scalar('Loss/Train', avg_train_loss, epoch)
-        writer.add_scalar('MAE/Train', avg_train_mae, epoch)
-        writer.add_scalar('Loss/Validation', avg_val_loss, epoch)
-        writer.add_scalar('MAE/Validation', avg_val_mae, epoch)
-        
-        history['train_loss'].append(avg_train_loss)
-        history['train_mae'].append(avg_train_mae)
-        history['val_loss'].append(avg_val_loss)
-        history['val_mae'].append(avg_val_mae)
-        
-        # Check for improvement
-        if avg_val_mae < best_val_mae:
-            best_val_mae = avg_val_mae
-            checkpoint_path = os.path.join(output_dir, f"diffusion_model_epoch_{epoch}.pt")
-            torch.save(diffusion_model.state_dict(), checkpoint_path)
-            print(f"Saved best model to '{checkpoint_path}'")
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-            print(f"No improvement in validation MAE for {epochs_no_improve} epoch(s).")
-            if epochs_no_improve >= patience:
-                print("Early stopping triggered.")
-                break
-    
-    # Close TensorBoard writer
-    writer.close()
-    
-    print("Training complete.")
-    return diffusion_model, history
 
 ###############################################################################
 #                        Denoising Auto-Encoder (DAE)
@@ -1457,9 +1401,11 @@ class DenoisingAutoencoder(nn.Module):
         logits = self.fc(outputs)
         return logits
 
+
 def create_denoising_autoencoder(vocab_size, embedding_dim=128, latent_dim=256, max_length=128):
     model = DenoisingAutoencoder(vocab_size, embedding_dim, latent_dim, max_length)
     return model
+
 
 def create_noise(input_text, drop_prob=0.2):
     output = []
@@ -1469,6 +1415,7 @@ def create_noise(input_text, drop_prob=0.2):
         else:
             output.append(ch)
     return "".join(output)
+
 
 def train_denoising_autoencoder(texts, tokenizer, max_length=128, test_size=0.2, 
                                 embedding_dim=128, latent_dim=256,
@@ -1564,6 +1511,7 @@ def train_denoising_autoencoder(texts, tokenizer, max_length=128, test_size=0.2,
     torch.save(dae_model.state_dict(), final_model_path)
     print(f"DAE model saved to '{final_model_path}'")
     return dae_model, history
+
 
 ###############################################################################
 #                        Masked Language Modeling (MLM)
@@ -1661,6 +1609,7 @@ def train_masked_language_model(texts, model_name="aubmindlab/bert-base-arabertv
     tokenizer.save_pretrained(os.path.join(output_dir, "masked_lm_model"))
     print("Masked LM Model and tokenizer saved.")
     return model, tokenizer, history
+
 
 ##############################################################################
 #                        Contrastive Learning (Siamese)
@@ -1877,6 +1826,7 @@ def train_poetic_rl(model_name="aubmindlab/aragpt2-base",
     print("Poetic RL Model and tokenizer saved.")
     return model, tokenizer
 
+
 ###############################################################################
 #                  Example Main Block (for demonstration)
 ###############################################################################
@@ -1886,9 +1836,9 @@ if __name__ == "__main__":
     EXAMPLE: 
      1) Load ThePoet pipeline
      2) Load your trained AraGPT2 + Tokenizer
-     3) (Optional) Load Diffusion model 
+     3) Load Diffusion model 
      4) Provide a modern prompt 
-     5) Generate final poem via ThePoet -> AraGPT2.
+     5) Generate final poem via ThePoet -> AraGPT2 -> Diffusion.
     """
     import os
     import pandas as pd
@@ -1979,6 +1929,14 @@ if __name__ == "__main__":
         print(f"Error initializing AraGPT2 model: {e}")
         sys.exit(1)
 
+    # Initialize the preprocessor
+    try:
+        preprocessor = ArabertPreprocessor(model_name='aubmindlab/arabertv2')
+        print("Initialized ArabertPreprocessor.")
+    except Exception as e:
+        print(f"Error initializing ArabertPreprocessor: {e}")
+        sys.exit(1)
+
     # Fine-tuning AraGPT2 with improved training function
     try:
         trained_transformer, hist = train_aragpt2_for_classical_style(
@@ -2045,84 +2003,75 @@ if __name__ == "__main__":
     # -------------
     # 3) Diffusion Model
     # -------------
-    # If you wish to include the diffusion model, uncomment and adjust the following:
-    """
-    max_bayt_len = 128  # Ensure consistency
-    encoding_dim = 8
-    input_shape = (max_bayt_len, encoding_dim)
+    # Initialize and load the Diffusion Model
+    print("Initializing Diffusion Model...")
     diffusion_model_params = {
         'num_transformer_blocks': 4,
         'num_heads': 8,
         'key_dim': 64,
         'ffn_units': 512
     }
-    print("Creating diffusion model...")
-    diffusion_model = create_diffusion_model(input_shape, diffusion_model_params)
-    print("Diffusion model created.")
+    input_shape = (max_bayt_len, encoding_dim)
+    diffusion_model = create_diffusion_model_pytorch(input_shape, diffusion_model_params).to(device)
+    print("Diffusion Model initialized.")
 
-    # Vectorize training and validation data
-    print("Vectorizing training and validation data...")
-    def string_with_tashkeel_vectorizer_per_batch(batch_series, max_bayt_len):
-        out = []
-        for val in batch_series:
-            out.append(string_with_tashkeel_vectorizer(val, max_bayt_len))
-        return np.stack(out, axis=0)
+    # Optionally, load a pre-trained diffusion model
+    diffusion_checkpoint_path = os.path.join(diffusion_output_dir, "diffusion_model_final.pt")
+    if os.path.exists(diffusion_checkpoint_path):
+        diffusion_model.load_state_dict(torch.load(diffusion_checkpoint_path, map_location=device))
+        print(f"Loaded pre-trained Diffusion Model from '{diffusion_checkpoint_path}'")
+    else:
+        print("No pre-trained Diffusion Model found. Proceeding with randomly initialized model.")
 
-    X_train_enc = string_with_tashkeel_vectorizer_per_batch(pd.Series(train_subset['text']), max_bayt_len=128)
-    Y_train_enc = X_train_enc.copy()
-    X_valid_enc = string_with_tashkeel_vectorizer_per_batch(pd.Series(valid_subset['text']), max_bayt_len=128)
-    Y_valid_enc = X_valid_enc.copy()
+    # ---------------
+    # 4) Train Diffusion Model (Optional)
+    # ---------------
+    # Uncomment the following block to train the Diffusion Model
 
-    batch_size = 8
-    epochs = 5
-    print("Training diffusion model (example)...")
-    ckpt_path = os.path.join(diffusion_output_dir, "diff_ckpt")
-    # Replace Keras callbacks with PyTorch equivalents or custom implementations
-    # For simplicity, omitted here
-    diffusion_history = diffusion_model.fit(
-        X_train_enc, Y_train_enc,
-        validation_data=(X_valid_enc, Y_valid_enc),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=[ckpt, es, tb]
-    )
+    print("Training Diffusion Model...")
+    try:
+        trained_combined_model, training_history = train_diffusion_with_gpt2_decoder(
+            df_classical=train_subset,
+            diffusion_model=diffusion_model,
+            tokenizer=transformer_tokenizer,
+            preprocessor=preprocessor,
+            max_length=128,
+            max_bayt_len=128,
+            encoding_dim=8,
+            epochs=10,
+            batch_size=8,
+            output_dir=diffusion_output_dir,
+            learning_rate=1e-4,
+            patience=3,
+            device='cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        print("Diffusion Model training complete.")
+    except Exception as e:
+        print(f"Error during Diffusion Model training: {e}")
+        sys.exit(1)
 
-    final_diffusion_path = os.path.join(diffusion_output_dir, "diffusion_model_final.pt")
-    torch.save(diffusion_model.state_dict(), final_diffusion_path)
-    print(f"Final diffusion model saved to '{final_diffusion_path}'")
-
-    # Plot diffusion training
-    plt.figure(figsize=(10, 4))
-    plt.plot(diffusion_history['loss'], label='Train Loss')
-    plt.plot(diffusion_history['val_loss'], label='Val Loss')
-    plt.title("Diffusion Model Loss")
-    plt.legend()
-    plt.show()
-
-    plt.figure(figsize=(10, 4))
-    plt.plot(diffusion_history['mae'], label='Train MAE')
-    plt.plot(diffusion_history['val_mae'], label='Val MAE')
-    plt.title("Diffusion Model MAE")
-    plt.legend()
-    plt.show()
-    """
+    # Save the final combined model
+    final_model_path = os.path.join(diffusion_output_dir, 'final_diffusion_model_with_decoder.pt')
+    torch.save(trained_combined_model.state_dict(), final_model_path)
+    print(f"Final combined model saved to '{final_model_path}'")
 
     # ------------------
-    # 4) Provide a Modern Prompt
+    # 5) Provide a Modern Prompt
     # ------------------
     modern_prompt = "يا جمال الزمان ويا نور الأمل"
 
     # ------------------
-    # 5) Generate Final Poem via ThePoet -> AraGPT2
+    # 6) Generate Final Poem via ThePoet -> AraGPT2 -> Diffusion
     # ------------------
-    print("Generating final classical poem by chaining ThePoet -> AraGPT2...")
+    print("Generating final classical poem by chaining ThePoet -> AraGPT2 -> Diffusion...")
     try:
         final_poem = generate_classical_poem_with_thepoet(
             modern_prompt=modern_prompt,
             poet_pipeline=poet_pipeline,
             transformer_model=trained_transformer,
             transformer_tokenizer=transformer_tokenizer,
-            # diffusion_model=diffusion_model,  # Uncomment if using diffusion
+            diffusion_model=trained_combined_model,  # Pass the trained combined model here
+            diffusion_tokenizer=transformer_tokenizer,  # Assuming same tokenizer; adjust if different
             max_length=128,
             device='cuda' if torch.cuda.is_available() else 'cpu'
         )
