@@ -515,7 +515,7 @@ class AraGPT2ForClassicalStyle(nn.Module):
         
         return model_instance
 
-def train_aragpt2_for_classical_style(df_classical, tokenizer, model,
+def train_aragpt2_for_classical_style(df_classical, tokenizer, model, preprocessor,
                                       max_length=128, epochs=10, batch_size=8,
                                       output_dir='./transformer_output', device='cuda' if torch.cuda.is_available() else 'cpu',
                                       freeze_layers=0, weight_decay=0.01, 
@@ -527,6 +527,7 @@ def train_aragpt2_for_classical_style(df_classical, tokenizer, model,
         df_classical (pd.DataFrame): DataFrame containing classical poems with a 'text' column.
         tokenizer (AutoTokenizer): Tokenizer for AraGPT2.
         model (AraGPT2ForClassicalStyle): Compiled AraGPT2 model.
+        preprocessor (ArabertPreprocessor): Preprocessor for Arabic text.
         max_length (int): Maximum sequence length.
         epochs (int): Number of training epochs.
         batch_size (int): Batch size for training.
@@ -543,6 +544,7 @@ def train_aragpt2_for_classical_style(df_classical, tokenizer, model,
     """
     import torch
     from torch.utils.tensorboard import SummaryWriter
+    from tqdm import tqdm  # Ensure tqdm is imported
 
     os.makedirs(output_dir, exist_ok=True)
     
@@ -661,6 +663,7 @@ def train_aragpt2_for_classical_style(df_classical, tokenizer, model,
     return model, history
 
 
+
 def inference_convert_classical(classical_verse, tokenizer, model, max_length=128, device='cuda' if torch.cuda.is_available() else 'cpu'):
     """
     Converts a diacritized classical verse using the AraGPT2 model.
@@ -703,6 +706,16 @@ def inference_convert_classical(classical_verse, tokenizer, model, max_length=12
 #                        Diffusion Model in PyTorch
 ###############################################################################
 
+class DiffusionDatasetWithLabels(Dataset):
+    def __init__(self, embedded_X, input_ids):
+        self.X = embedded_X.float()
+        self.labels = input_ids.long()
+    
+    def __len__(self):
+        return len(self.X)
+    
+    def __getitem__(self, idx):
+        return self.X[idx], self.labels[idx]
 class TransformerBlock(nn.Module):
     def __init__(self, input_dim, num_heads, key_dim, ffn_units):
         """
@@ -797,6 +810,33 @@ class DiffusionModel(nn.Module):
             x = block(x)
         x = self.output_layer(x)
         return x
+def create_diffusion_model_pytorch(input_shape, model_params):
+    """
+    Creates the Diffusion Model in PyTorch.
+
+    Args:
+        input_shape (tuple): Shape of the input (seq_len, encoding_dim)
+        model_params (dict): Parameters for the model architecture.
+
+    Returns:
+        DiffusionModel: An instance of the DiffusionModel class.
+    """
+    seq_len, encoding_dim = input_shape
+    model = DiffusionModel(input_dim=encoding_dim, model_params=model_params)
+    return model
+
+def preprocess_texts(texts, preprocessor):
+    """
+    Applies ArabertPreprocessor to a list of texts.
+
+    Args:
+        texts (list of str): Raw text data.
+        preprocessor (ArabertPreprocessor): Preprocessor instance.
+
+    Returns:
+        list of str: Preprocessed text data.
+    """
+    return [preprocessor.preprocess(text) for text in texts]
 
 def embed_tokens_pytorch(input_ids, max_bayt_len, encoding_dim):
     """
@@ -921,6 +961,9 @@ def train_diffusion_with_gpt2_decoder(
     # Preprocess texts
     preprocessed_texts = preprocess_texts(texts, preprocessor)
     
+    # Apply Arabic character filtering to ensure clean data
+    preprocessed_texts = [filter_arabic(text) for text in preprocessed_texts]
+    
     encodings = tokenizer(
         preprocessed_texts, 
         max_length=max_length, 
@@ -1020,6 +1063,7 @@ def train_diffusion_with_gpt2_decoder(
     
     print("Training complete.")
     return combined_model, history
+
 
 
 ###############################################################################
@@ -1262,7 +1306,7 @@ def generate_classical_poem_with_thepoet(
         diffusion_model (DiffusionModelWithDecoder, optional): Trained Diffusion model with Decoder.
         diffusion_tokenizer (AutoTokenizer, optional): Tokenizer for diffusion model if needed.
         max_length (int): Maximum sequence length for models.
-        device (str): Device to perform inference on.
+        device (str): Device to perform inference on ('cuda' or 'cpu').
 
     Returns:
         str: Final refined classical Arabic poem.
@@ -1334,12 +1378,16 @@ def generate_classical_poem_with_thepoet(
         )
         print(f"Classical Draft from AraGPT2: {classical_draft}")
 
+        # Step 4c.1: Clean the classical draft to remove non-Arabic characters
+        classical_draft_clean = filter_arabic(classical_draft)
+        print(f"Classical Draft after filtering non-Arabic characters: {classical_draft_clean}")
+
         # Step 4d: Diffusion Model Refinement (Optional)
         if diffusion_model is not None:
             print("Passing verse through Diffusion Model for further refinement...")
             # Vectorize the refined verse
             diffusion_input_enc = diffusion_tokenizer(
-                classical_draft,
+                classical_draft_clean,
                 max_length=max_length,
                 padding='max_length',
                 truncation=True,
@@ -1347,10 +1395,10 @@ def generate_classical_poem_with_thepoet(
             )
             diffusion_input_ids = diffusion_input_enc['input_ids'].to(device)
             diffusion_attention_mask = diffusion_input_enc['attention_mask'].to(device)
-            
+
             # Embed tokens
             diffusion_embeddings = embed_tokens_pytorch(diffusion_input_ids, max_bayt_len, encoding_dim).to(device)  # Shape: (batch_size, seq_len, encoding_dim)
-            
+
             # Pass through the combined diffusion model with decoder
             with torch.no_grad():
                 outputs = diffusion_model(diffusion_embeddings, labels=diffusion_input_ids)
@@ -1361,10 +1409,12 @@ def generate_classical_poem_with_thepoet(
                 logits = outputs.logits  # Shape: (batch_size, seq_len, vocab_size)
                 predicted_ids = torch.argmax(logits, dim=-1)
                 refined_text = diffusion_tokenizer.decode(predicted_ids[0], skip_special_tokens=True)
+                # Apply Arabic character filtering
+                refined_text = filter_arabic(refined_text)
                 print(f"Final Verse after Diffusion Refinement: {refined_text}")
         else:
             # If diffusion model is not used
-            refined_text = classical_draft
+            refined_text = classical_draft_clean
             print(f"Final Verse after AraGPT2 Refinement: {refined_text}")
 
         # Append to processed verses
@@ -1377,6 +1427,7 @@ def generate_classical_poem_with_thepoet(
     final_poem = '\n'.join(processed_verses)
     print(f"\n==== Final Chained Poem ====\n{final_poem}\n================================")
     return final_poem
+
 
 ###############################################################################
 #                        Denoising Auto-Encoder (DAE)
