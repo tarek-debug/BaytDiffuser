@@ -108,4 +108,14 @@ java -cp ".:./QCRI/Dev/ArabicNLP/Farasa/FarasaDiacritizeJar/dist/FarasaDiacritiz
 
 ---
 
-This program uses the Farasa library to process text data efficiently and saves the diacritized version of your dataset. Let me know if you encounter any issues! 😊
+This program uses the Farasa library to process text data efficiently and saves the diacritized version of the your dataset. 
+
+
+
+
+===================================================
+
+To run the verse one:
+
+tarek@AcerTarek123:/mnt/c/Users/tarek/OneDrive - Trinity College/Documents/Machine Learning Projects/BaytDiffuser/BaytDiffuser/scripts/java$ javac -cp ".:./QCRI/Dev/ArabicNLP/Farasa/FarasaDiacritizeJar/dist/FarasaDiacritizeJar.jar:.:./QCRI/Dev/ArabicNLP/Farasa/FarasaDiacritizeJar/dist/lib/*" VerseDiacritizer.java
+tarek@AcerTarek123:/mnt/c/Users/tarek/OneDrive - Trinity College/Documents/Machine Learning Projects/BaytDiffuser/BaytDiffuser/scripts/java$ java -cp ".:./QCRI/Dev/ArabicNLP/Farasa/FarasaDiacritizeJar/dist/FarasaDiacritizeJar.jar:.:./QCRI/Dev/ArabicNLP/Farasa/FarasaDiacritizeJar/dist/lib/*" VerseDiacritizer
