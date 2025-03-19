@@ -176,9 +176,15 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# models
+models/
 
 # Extra
 Extra/
 
 # data
 data/
+
+# transformer output
+seq2seq_output/
+transformer_output/
