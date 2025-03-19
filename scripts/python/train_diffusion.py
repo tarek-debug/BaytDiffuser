@@ -1,87 +1,90 @@
-# train_diffusion.py
-
-"""
-train_diffusion.py
-
-Trains a diffusion model to iteratively refine text embeddings.
-The model takes noisy text representations and refines them to produce classical Arabic poetry.
-
-Usage:
-    python train_diffusion.py --train_data ../data/processed --epochs 50 --batch_size 32 --output_dir ../models/diffusion
-"""
-
+#!/usr/bin/env python
 import os
-import argparse
+import sys
 import pandas as pd
-from BaytDiffuser.scripts.python.utils import create_diffusion_model, train_diffusion_model, load_encoder, get_input_encoded_data_h5
+from sklearn.model_selection import train_test_split
+from utils import (
+    create_diffusion_model_pytorch,
+    train_diffusion_with_gpt2_decoder,
+    AutoTokenizer,
+    ArabertPreprocessor
+)
 
-def load_dataset_from_csv(processed_dir):
-    """
-    Loads the processed CSV files and converts them into lists of dictionaries.
-    
-    Args:
-        processed_dir (str): Directory containing train.csv, valid.csv, test.csv
-    
-    Returns:
-        tuple: (train_data, valid_data, test_data)
-    """
-    train_path = os.path.join(processed_dir, "train.csv")
-    valid_path = os.path.join(processed_dir, "valid.csv")
-    test_path = os.path.join(processed_dir, "test.csv")
+# Define paths
+processed_data_path = '../data/processed/processed_taweel_data.csv'
+diffusion_output_dir = '../models/diffusion'
 
-    train_df = pd.read_csv(train_path, encoding='utf-8-sig')
-    valid_df = pd.read_csv(valid_path, encoding='utf-8-sig')
-    test_df = pd.read_csv(test_path, encoding='utf-8-sig')
+os.makedirs(diffusion_output_dir, exist_ok=True)
 
-    # Convert to list of dicts
-    train_data = train_df.to_dict(orient='records')
-    valid_data = valid_df.to_dict(orient='records')
-    test_data = test_df.to_dict(orient='records')
+# Load processed data and subset for testing
+print("Loading processed data for Diffusion Model training...")
+try:
+    processed_df = pd.read_csv(processed_data_path, encoding='utf-8-sig')
+    print(f"Data loaded with {len(processed_df)} records.")
+except Exception as e:
+    print(f"Error loading data: {e}")
+    sys.exit(1)
 
-    return train_data, valid_data, test_data
+# Subset data for testing
+subset = True
+if subset:
+    train_df, _ = train_test_split(processed_df, test_size=0.2, random_state=42)
+    train_subset = train_df.sample(n=100, random_state=42)
+else:
+    train_subset = processed_df
 
-def main():
-    parser = argparse.ArgumentParser(description="Train a diffusion model for Arabic poetry.")
-    parser.add_argument("--train_data", type=str, required=True,
-                        help="Directory containing processed train.csv, valid.csv, test.csv.")
-    parser.add_argument("--epochs", type=int, default=50,
-                        help="Number of training epochs.")
-    parser.add_argument("--batch_size", type=int, default=32,
-                        help="Training batch size.")
-    parser.add_argument("--output_dir", type=str, default="../models/diffusion",
-                        help="Directory to save trained diffusion model checkpoints.")
-    parser.add_argument("--model_params", type=str, default="{}",
-                        help="JSON string of model parameters.")
-    args = parser.parse_args()
+print(f"Training on {len(train_subset)} records (subset).")
 
-    # Load data
-    train_data, valid_data, test_data = load_dataset_from_csv(args.train_data)
+# Initialize tokenizer and preprocessor
+transformer_model_name = "aubmindlab/aragpt2-base"
+try:
+    tokenizer = AutoTokenizer.from_pretrained(transformer_model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+except Exception as e:
+    print(f"Error loading tokenizer: {e}")
+    sys.exit(1)
 
-    # Define model parameters
-    import json
-    model_params = json.loads(args.model_params)
+try:
+    preprocessor = ArabertPreprocessor(model_name='aubmindlab/arabertv2')
+except Exception as e:
+    print(f"Error initializing preprocessor: {e}")
+    sys.exit(1)
 
-    # Define input shape based on preprocessed data
-    sample_text = train_data[0]['text']
-    max_bayt_len = 1000  # Adjust based on your preprocessing
-    encoding_dim = 8  # Based on 8-bit encoding
+# Create Diffusion model
+max_bayt_len = 128
+encoding_dim = 8
+diffusion_model_params = {
+    'num_transformer_blocks': 4,
+    'num_heads': 8,
+    'key_dim': 64,
+    'ffn_units': 512
+}
+input_shape = (max_bayt_len, encoding_dim)
+diffusion_model = create_diffusion_model_pytorch(input_shape, diffusion_model_params)
 
-    input_shape = (max_bayt_len, encoding_dim)
-
-    # Create diffusion model
-    diffusion_model = create_diffusion_model(input_shape, model_params)
-
-    # Train the diffusion model
-    history = train_diffusion_model(
-        model=diffusion_model,
-        train_data=train_data,
-        valid_data=valid_data,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        output_dir=args.output_dir
+# Train Diffusion Model with GPT2 Decoder
+print("Training Diffusion Model with GPT2 Decoder...")
+try:
+    trained_diffusion, history = train_diffusion_with_gpt2_decoder(
+        df_classical=train_subset,
+        diffusion_model=diffusion_model,
+        tokenizer=tokenizer,
+        preprocessor=preprocessor,
+        max_length=128,
+        max_bayt_len=max_bayt_len,
+        encoding_dim=encoding_dim,
+        epochs=10,
+        batch_size=8,
+        output_dir=diffusion_output_dir,
+        learning_rate=1e-4,
+        patience=3,
+        device='cuda' if os.environ.get("CUDA_VISIBLE_DEVICES") or os.name != 'nt' else 'cpu'
     )
-
-    print(f"Diffusion model training complete. Model saved to {args.output_dir}.")
-
-if __name__ == "__main__":
-    main()
+    final_diffusion_path = os.path.join(diffusion_output_dir, 'final_diffusion_model_with_decoder.pt')
+    import torch
+    torch.save(trained_diffusion.state_dict(), final_diffusion_path)
+    print(f"Diffusion model saved to '{final_diffusion_path}'.")
+except Exception as e:
+    print(f"Error during Diffusion training: {e}")
+    sys.exit(1)
