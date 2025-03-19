@@ -1,87 +1,102 @@
-# train_transformer.py
-
-"""
-train_transformer.py
-
-This script trains a Transformer-based model (e.g., AraBERT, AraGPT2)
-to transform modern Arabic poetry into classical style.
-Adapts to the APCD dataset.
-
-Usage:
-    python train_transformer.py --train_data ../data/processed --model_name AraGPT2 --epochs 10 --batch_size 16 --output_dir ../models/transformers
-"""
-
+#!/usr/bin/env python
 import os
-import argparse
+import sys
 import pandas as pd
-from BaytDiffuser.scripts.python.utils import create_transformer_model, train_transformer_model, load_encoder, get_input_encoded_data_h5
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
 
-def load_dataset_from_csv(processed_dir):
-    """
-    Loads the processed CSV files and converts them into lists of dictionaries.
-    
-    Args:
-        processed_dir (str): Directory containing train.csv, valid.csv, test.csv
-    
-    Returns:
-        tuple: (train_data, valid_data, test_data)
-    """
-    train_path = os.path.join(processed_dir, "train.csv")
-    valid_path = os.path.join(processed_dir, "valid.csv")
-    test_path = os.path.join(processed_dir, "test.csv")
+# Import functions from utils.py
+from utils import (
+    train_aragpt2_for_classical_style,
+    AutoTokenizer,
+    ArabertPreprocessor
+)
 
-    train_df = pd.read_csv(train_path, encoding='utf-8-sig')
-    valid_df = pd.read_csv(valid_path, encoding='utf-8-sig')
-    test_df = pd.read_csv(test_path, encoding='utf-8-sig')
+# Define paths
+processed_data_path = '../data/processed/processed_taweel_data.csv'
+transformer_output_dir = '../models/transformers'
 
-    # Convert to list of dicts
-    train_data = train_df.to_dict(orient='records')
-    valid_data = valid_df.to_dict(orient='records')
-    test_data = test_df.to_dict(orient='records')
+# Create output directory if it doesn't exist
+os.makedirs(transformer_output_dir, exist_ok=True)
 
-    return train_data, valid_data, test_data
+# Load processed data and subset for testing
+print("Loading processed data for Transformer training...")
+try:
+    processed_df = pd.read_csv(processed_data_path, encoding='utf-8-sig')
+    print(f"Data loaded with {len(processed_df)} records.")
+except Exception as e:
+    print(f"Error loading data: {e}")
+    sys.exit(1)
 
-def main():
-    parser = argparse.ArgumentParser(description="Train a Transformer-based model for Arabic poetry.")
-    parser.add_argument("--train_data", type=str, required=True,
-                        help="Directory containing processed train.csv, valid.csv, test.csv.")
-    parser.add_argument("--model_name", type=str, default="aubmindlab/bert-base-arabertv2",
-                        help="Name of the pre-trained transformer model to use.")
-    parser.add_argument("--epochs", type=int, default=10,
-                        help="Number of training epochs.")
-    parser.add_argument("--batch_size", type=int, default=16,
-                        help="Training batch size.")
-    parser.add_argument("--output_dir", type=str, default="../models/transformers",
-                        help="Directory to save trained transformer model checkpoints.")
-    parser.add_argument("--max_length", type=int, default=1000,
-                        help="Maximum sequence length for tokenization.")
-    args = parser.parse_args()
+# Subset data for testing
+subset = True
+if subset:
+    train_df, _ = train_test_split(processed_df, test_size=0.2, random_state=42)
+    train_subset = train_df.sample(n=100, random_state=42)
+else:
+    train_subset = processed_df
 
-    # Load data
-    train_data, valid_data, test_data = load_dataset_from_csv(args.train_data)
+print(f"Training on {len(train_subset)} records (subset).")
 
-    # Define max sequence length
-    max_length = args.max_length
+# Initialize tokenizer and preprocessor
+transformer_model_name = "aubmindlab/aragpt2-base"
+try:
+    tokenizer = AutoTokenizer.from_pretrained(transformer_model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        print("Assigned EOS token as PAD token.")
+except Exception as e:
+    print(f"Error loading tokenizer: {e}")
+    sys.exit(1)
 
-    # Define model parameters if needed
-    # For simplicity, model parameters are defined within create_transformer_model
+try:
+    preprocessor = ArabertPreprocessor(model_name='aubmindlab/arabertv2')
+    print("ArabertPreprocessor initialized.")
+except Exception as e:
+    print(f"Error initializing preprocessor: {e}")
+    sys.exit(1)
 
-    # Create or load transformer model
-    transformer_model, tokenizer = create_transformer_model(args.model_name, max_length)
-
-    # Train the transformer model
-    history = train_transformer_model(
-        model=transformer_model,
+# Train the AraGPT2 Transformer model for classical style
+print("Training Transformer model (AraGPT2)...")
+try:
+    trained_model, history = train_aragpt2_for_classical_style(
+        df_classical=train_subset,
         tokenizer=tokenizer,
-        train_data=train_data,
-        valid_data=valid_data,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        output_dir=args.output_dir,
-        max_length=max_length
+        model=None,  # Let the function initialize the model via from_pretrained inside utils if needed
+        preprocessor=preprocessor,
+        max_length=128,
+        epochs=10,
+        batch_size=4,
+        output_dir=transformer_output_dir,
+        device='cuda' if os.environ.get("CUDA_VISIBLE_DEVICES") or os.name != 'nt' else 'cpu',
+        freeze_layers=0,
+        weight_decay=0.01,
+        patience=3,
+        max_grad_norm=1.0
     )
+    print("Transformer training complete.")
+except Exception as e:
+    print(f"Error during Transformer training: {e}")
+    sys.exit(1)
 
-    print(f"Transformer model training complete. Model saved to {args.output_dir}.")
+# Save the trained model and tokenizer
+try:
+    trained_model.save_pretrained(transformer_output_dir)
+    tokenizer.save_pretrained(transformer_output_dir)
+    print(f"Transformer model and tokenizer saved to '{transformer_output_dir}'.")
+except Exception as e:
+    print(f"Error saving Transformer model/tokenizer: {e}")
+    sys.exit(1)
 
-if __name__ == "__main__":
-    main()
+# Optionally plot training history
+try:
+    plt.figure(figsize=(10, 4))
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Validation Loss')
+    plt.title("AraGPT2 Training Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.show()
+except Exception as e:
+    print(f"Error plotting history: {e}")
